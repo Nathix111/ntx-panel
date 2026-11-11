@@ -150,6 +150,13 @@ echo "==> Installing executable to /usr/local/bin/ntx-server..."
 $SUDO install -d /usr/local/bin
 $SUDO install -m 755 "$BINARY_SRC" /usr/local/bin/ntx-server
 
+# Install uninstall helper to /usr/local/bin/ntx-uninstall if available
+if [ -f "$TMP_DIR/uninstall.sh" ]; then
+    $SUDO install -m 755 "$TMP_DIR/uninstall.sh" /usr/local/bin/ntx-uninstall
+elif [ -f "${SCRIPT_DIR:-}/uninstall.sh" ]; then
+    $SUDO install -m 755 "$SCRIPT_DIR/uninstall.sh" /usr/local/bin/ntx-uninstall
+fi
+
 # 6. Register & start systemd service
 if command -v systemctl >/dev/null 2>&1; then
     echo "==> Registering systemd service..."
