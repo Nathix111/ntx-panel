@@ -2346,6 +2346,7 @@ dependencies = [
  "sysinfo",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-stream",
  "toml",
  "tonic",
  "tracing",
@@ -2371,6 +2372,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-stream",
  "toml",
  "tonic",
  "tracing",
@@ -3989,6 +3991,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
