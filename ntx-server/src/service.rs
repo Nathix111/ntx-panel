@@ -66,7 +66,7 @@ WantedBy=multi-user.target
         );
 
         let unit_path = std::path::Path::new("/etc/systemd/system/ntx-server.service");
-        if let Err(e) = std::fs::write(unit_path, unit_content) {
+        if let Err(e) = std::fs::write(unit_path, &unit_content) {
             println!(
                 "Could not write to /etc/systemd/system/ (root required: {}).",
                 e
@@ -83,12 +83,46 @@ WantedBy=multi-user.target
                 .output();
             println!("Systemd unit installed and enabled!");
         }
+
+        if let Ok((config, _)) = crate::config::load_or_create() {
+            println!("Pre-Shared Key (PSK): {}", config.server.psk);
+        }
     }
 
     Ok(())
 }
 
-pub fn uninstall() -> Result<()> {
+pub fn purge_config_directories() -> Vec<std::path::PathBuf> {
+    let mut dirs_to_remove = vec![
+        std::path::PathBuf::from("/etc/ntx-server"),
+        std::path::PathBuf::from("/root/.config/ntx-server"),
+    ];
+
+    if let Some(config_dir) = dirs::config_dir() {
+        let user_cfg = config_dir.join("ntx-server");
+        if !dirs_to_remove.contains(&user_cfg) {
+            dirs_to_remove.push(user_cfg);
+        }
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        let home_cfg = std::path::PathBuf::from(home).join(".config").join("ntx-server");
+        if !dirs_to_remove.contains(&home_cfg) {
+            dirs_to_remove.push(home_cfg);
+        }
+    }
+
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        let sudo_cfg = std::path::PathBuf::from(format!("/home/{}/.config/ntx-server", sudo_user));
+        if !dirs_to_remove.contains(&sudo_cfg) {
+            dirs_to_remove.push(sudo_cfg);
+        }
+    }
+
+    dirs_to_remove
+}
+
+pub fn uninstall(purge: bool) -> Result<()> {
     #[cfg(windows)]
     {
         info!("Stopping Windows service '{}'...", SERVICE_NAME);
@@ -113,6 +147,17 @@ pub fn uninstall() -> Result<()> {
 
         println!("Service '{}' successfully uninstalled!", SERVICE_NAME);
         println!("{}", stdout);
+
+        if purge {
+            info!("Purging configurations...");
+            for dir in purge_config_directories() {
+                if dir.exists() {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    println!("Deleted {}", dir.display());
+                }
+            }
+            println!("Purge complete.");
+        }
     }
 
     #[cfg(not(windows))]
@@ -128,10 +173,33 @@ pub fn uninstall() -> Result<()> {
         let unit_path = std::path::Path::new("/etc/systemd/system/ntx-server.service");
         if unit_path.exists() {
             let _ = std::fs::remove_file(unit_path);
-            let _ = Command::new("systemctl").arg("daemon-reload").output();
         }
+        let _ = Command::new("systemctl").arg("daemon-reload").output();
 
         println!("Service 'ntx-server.service' uninstalled.");
+
+        if purge {
+            info!("Purging binary and configurations...");
+            let bin_path = std::path::Path::new("/usr/local/bin/ntx-server");
+            if bin_path.exists() {
+                if let Err(e) = std::fs::remove_file(bin_path) {
+                    eprintln!("Warning: failed to delete {}: {}", bin_path.display(), e);
+                } else {
+                    println!("Deleted {}", bin_path.display());
+                }
+            }
+
+            for dir in purge_config_directories() {
+                if dir.exists() {
+                    if let Err(e) = std::fs::remove_dir_all(&dir) {
+                        eprintln!("Warning: failed to remove {}: {}", dir.display(), e);
+                    } else {
+                        println!("Deleted configuration directory {}", dir.display());
+                    }
+                }
+            }
+            println!("Purge complete.");
+        }
     }
 
     Ok(())
@@ -171,5 +239,12 @@ mod tests {
     fn test_constants() {
         assert_eq!(SERVICE_NAME, "ntx-server");
         assert_eq!(SERVICE_DISPLAY_NAME, "NTX Panel Agent");
+    }
+
+    #[test]
+    fn test_purge_config_directories() {
+        let dirs = purge_config_directories();
+        assert!(dirs.contains(&std::path::PathBuf::from("/etc/ntx-server")));
+        assert!(dirs.contains(&std::path::PathBuf::from("/root/.config/ntx-server")));
     }
 }

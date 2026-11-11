@@ -72,6 +72,10 @@ pub fn default_config_path() -> PathBuf {
     if let Ok(env_path) = std::env::var("NTX_CONFIG_PATH") {
         return PathBuf::from(env_path);
     }
+    let etc_path = PathBuf::from("/etc/ntx-server/config.toml");
+    if etc_path.exists() {
+        return etc_path;
+    }
     if let Some(config_dir) = dirs::config_dir() {
         config_dir.join("ntx-server").join("config.toml")
     } else {

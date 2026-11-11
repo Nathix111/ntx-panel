@@ -16,12 +16,14 @@ fn print_help() {
         r#"NTX Panel Server Agent (v{})
 
 Usage:
-    ntx-server [command]
+    ntx-server [command] [options]
 
 Commands:
     run            Run the agent server in foreground (default)
     install        Install the agent as a system service
     uninstall      Uninstall the agent system service
+                   Options:
+                     --purge, -p    Remove binary and wipe all configuration directories
     status         Show the status of the agent service
     config         Print the path and contents of the configuration file
     help, --help   Show this help message
@@ -33,7 +35,25 @@ Commands:
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let command = args.get(1).map(|s| s.as_str()).unwrap_or("run");
+
+    let is_help = args
+        .iter()
+        .skip(1)
+        .any(|a| a == "--help" || a == "-h" || a == "help");
+    if is_help {
+        print_help();
+        return Ok(());
+    }
+
+    let purge = args.iter().skip(1).any(|a| a == "--purge" || a == "-p");
+    let non_flags: Vec<&str> = args
+        .iter()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .map(|s| s.as_str())
+        .collect();
+
+    let command = non_flags.first().copied().unwrap_or("run");
 
     match command {
         "install" => {
@@ -43,7 +63,7 @@ async fn main() -> Result<()> {
         }
         "uninstall" => {
             init_logging();
-            service::uninstall()?;
+            service::uninstall(purge)?;
             Ok(())
         }
         "status" => {
@@ -60,10 +80,6 @@ async fn main() -> Result<()> {
             } else {
                 println!("(Config file does not exist yet. Run 'ntx-server run' to initialize.)");
             }
-            Ok(())
-        }
-        "help" | "--help" | "-h" => {
-            print_help();
             Ok(())
         }
         "run" => run_server().await,
