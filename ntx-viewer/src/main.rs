@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 pub mod app;
 pub mod auth;
 pub mod client;
@@ -24,6 +26,8 @@ fn main() -> eframe::Result<()> {
             .expect("Failed to create Tokio runtime"),
     );
 
+    let _guard = rt.enter();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
@@ -35,6 +39,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "NTX Panel",
         options,
-        Box::new(|cc| Ok(Box::new(app::NtxApp::new(cc, rt)))),
+        Box::new(|cc| Ok(Box::new(app::NtxApp::new(cc, rt.clone())))),
     )
 }

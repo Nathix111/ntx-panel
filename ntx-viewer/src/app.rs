@@ -68,7 +68,7 @@ impl NtxApp {
         let (disc_tx, disc_rx) = mpsc::channel(64);
         let (event_tx, event_rx) = mpsc::channel(128);
 
-        let discovery_handle = match start_discovery(disc_tx) {
+        let discovery_handle = match start_discovery(disc_tx, rt.handle().clone()) {
             Ok(handle) => Some(handle),
             Err(e) => {
                 warn!("Could not start mDNS discovery: {e}");
@@ -121,7 +121,7 @@ impl NtxApp {
 
         let (disc_tx, disc_rx) = mpsc::channel(64);
         self.discovery_rx = disc_rx;
-        match start_discovery(disc_tx) {
+        match start_discovery(disc_tx, self.rt.handle().clone()) {
             Ok(handle) => self.discovery_handle = Some(handle),
             Err(e) => warn!("Failed to restart discovery: {e}"),
         }

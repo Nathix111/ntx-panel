@@ -34,7 +34,10 @@ impl DiscoveryHandle {
 
 /// Start browsing mDNS for `_ntx._tcp.local.` services.
 /// Emits `DiscoveryEvent` through the provided mpsc channel.
-pub fn start_discovery(tx: mpsc::Sender<DiscoveryEvent>) -> anyhow::Result<DiscoveryHandle> {
+pub fn start_discovery(
+    tx: mpsc::Sender<DiscoveryEvent>,
+    handle: tokio::runtime::Handle,
+) -> anyhow::Result<DiscoveryHandle> {
     let daemon = ServiceDaemon::new().map_err(|e| anyhow::anyhow!("Failed to init mDNS: {e}"))?;
     let receiver = daemon
         .browse(NTX_SERVICE_TYPE)
@@ -43,7 +46,7 @@ pub fn start_discovery(tx: mpsc::Sender<DiscoveryEvent>) -> anyhow::Result<Disco
     let is_running = Arc::new(AtomicBool::new(true));
     let running_flag = Arc::clone(&is_running);
 
-    tokio::spawn(async move {
+    handle.spawn(async move {
         info!("mDNS discovery started browsing for {}", NTX_SERVICE_TYPE);
         while running_flag.load(Ordering::Relaxed) {
             match receiver.recv_async().await {
@@ -102,4 +105,26 @@ pub fn start_discovery(tx: mpsc::Sender<DiscoveryEvent>) -> anyhow::Result<Disco
         _daemon: Some(daemon),
         is_running,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_start_discovery_outside_runtime_context() {
+        let rt = tokio::runtime::Runtime::new().expect("create runtime");
+        let handle = rt.handle().clone();
+
+        // Run from an ordinary thread that has NO Tokio context entered
+        let thread_handle = std::thread::spawn(move || {
+            let (tx, _rx) = mpsc::channel(16);
+            let res = start_discovery(tx, handle);
+            assert!(res.is_ok(), "start_discovery should succeed without a tokio reactor on the current thread");
+            let disc = res.unwrap();
+            disc.stop();
+        });
+
+        thread_handle.join().expect("thread join");
+    }
 }
