@@ -26,7 +26,8 @@ pub fn start_announcement(config: &Config) -> Result<Option<ServiceDaemon>> {
         config.server.port,
         properties,
     )
-    .context("Failed to construct ServiceInfo for mDNS")?;
+    .context("Failed to construct ServiceInfo for mDNS")?
+    .enable_addr_auto();
 
     mdns.register(service_info)
         .context("Failed to register mDNS service")?;
