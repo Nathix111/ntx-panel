@@ -120,22 +120,54 @@ if [ -z "$BINARY_SRC" ]; then
     NTX_REPO="${NTX_REPO:-Nathix111/ntx-panel}"
     NTX_VERSION="${NTX_VERSION:-latest}"
 
-    if [ "$NTX_VERSION" = "latest" ]; then
-        DOWNLOAD_URL="https://github.com/${NTX_REPO}/releases/latest/download/${TARBALL_NAME}"
-    else
-        DOWNLOAD_URL="https://github.com/${NTX_REPO}/releases/download/${NTX_VERSION}/${TARBALL_NAME}"
+    # Try downloading via GitHub CLI (gh) if available and authenticated (works with private repos!)
+    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+        echo "==> Using authenticated GitHub CLI (gh) to fetch release asset..."
+        if [ "$NTX_VERSION" = "latest" ]; then
+            gh release download --repo "$NTX_REPO" --pattern "$TARBALL_NAME" --dir "$TMP_DIR" 2>/dev/null || true
+        else
+            gh release download "$NTX_VERSION" --repo "$NTX_REPO" --pattern "$TARBALL_NAME" --dir "$TMP_DIR" 2>/dev/null || true
+        fi
     fi
 
-    echo "==> Downloading ${TARBALL_NAME} from GitHub Releases..."
-    echo "    URL: $DOWNLOAD_URL"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fSL "$DOWNLOAD_URL" -o "$TMP_DIR/$TARBALL_NAME"
-    else
-        wget -qO "$TMP_DIR/$TARBALL_NAME" "$DOWNLOAD_URL"
+    # Fallback to curl / wget if not fetched via gh
+    if [ ! -f "$TMP_DIR/$TARBALL_NAME" ]; then
+        if [ "$NTX_VERSION" = "latest" ]; then
+            DOWNLOAD_URL="https://github.com/${NTX_REPO}/releases/latest/download/${TARBALL_NAME}"
+        else
+            DOWNLOAD_URL="https://github.com/${NTX_REPO}/releases/download/${NTX_VERSION}/${TARBALL_NAME}"
+        fi
+
+        echo "==> Downloading ${TARBALL_NAME} from GitHub Releases..."
+        echo "    URL: $DOWNLOAD_URL"
+
+        AUTH_HEADER=()
+        if command -v gh >/dev/null 2>&1 && GH_AUTH_TOKEN="$(gh auth token 2>/dev/null)" && [ -n "$GH_AUTH_TOKEN" ]; then
+            AUTH_HEADER=(-H "Authorization: Bearer ${GH_AUTH_TOKEN}")
+        elif [ -n "${GITHUB_TOKEN:-}" ]; then
+            AUTH_HEADER=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+        fi
+
+        if command -v curl >/dev/null 2>&1; then
+            curl -fSL ${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"} "$DOWNLOAD_URL" -o "$TMP_DIR/$TARBALL_NAME" 2>/dev/null || true
+        else
+            wget -qO "$TMP_DIR/$TARBALL_NAME" "$DOWNLOAD_URL" 2>/dev/null || true
+        fi
     fi
 
-    tar -xzf "$TMP_DIR/$TARBALL_NAME" -C "$TMP_DIR"
-    BINARY_SRC="$TMP_DIR/ntx-server"
+    if [ -f "$TMP_DIR/$TARBALL_NAME" ]; then
+        tar -xzf "$TMP_DIR/$TARBALL_NAME" -C "$TMP_DIR"
+        BINARY_SRC="$TMP_DIR/ntx-server"
+    fi
+fi
+
+# Fallback: build with cargo if local repo and cargo are available
+if [ -z "$BINARY_SRC" ] && [ -f "$SCRIPT_DIR/../Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+    echo "==> Prebuilt binary not found. Building locally via cargo build --release -p ntx-server..."
+    (cd "$SCRIPT_DIR/.." && cargo build --release -p ntx-server)
+    if [ -f "$SCRIPT_DIR/../target/release/ntx-server" ]; then
+        BINARY_SRC="$SCRIPT_DIR/../target/release/ntx-server"
+    fi
 fi
 
 if [ ! -f "$BINARY_SRC" ]; then
