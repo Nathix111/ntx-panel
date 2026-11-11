@@ -141,31 +141,51 @@ impl NtxApp {
         self.settings.default_psk.clone()
     }
 
-    fn initiate_connect(&mut self, device_id: &str) {
-        let (endpoint, dev_psk) = match self.devices.get_mut(device_id) {
-            Some(d) => {
-                d.status = ConnectionStatus::Connecting;
-                (d.grpc_endpoint(), d.psk.clone())
-            }
-            None => return,
-        };
-
-        let psk = if let Some(p) = dev_psk {
-            if !p.is_empty() {
-                p
-            } else {
+    fn initiate_connect(&mut self, device_id: &str, explicit_psk: Option<String>) {
+        if let Some(p) = explicit_psk {
+            let trimmed = p.trim().to_string();
+            if !trimmed.is_empty() {
+                if let Some(d) = self.devices.get_mut(device_id) {
+                    d.psk = Some(trimmed.clone());
+                }
                 self.settings
                     .device_psks
-                    .get(device_id)
-                    .cloned()
-                    .unwrap_or_else(|| self.settings.default_psk.clone())
+                    .insert(device_id.to_string(), trimmed);
+                let _ = self.settings.save();
             }
-        } else {
-            self.settings
-                .device_psks
-                .get(device_id)
-                .cloned()
-                .unwrap_or_else(|| self.settings.default_psk.clone())
+        }
+
+        let (endpoint, psk) = match self.devices.get_mut(device_id) {
+            Some(d) => {
+                let resolved_psk = d
+                    .psk
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| {
+                        self.settings
+                            .device_psks
+                            .get(device_id)
+                            .map(|s| s.as_str())
+                    })
+                    .or_else(|| {
+                        if !self.settings.default_psk.trim().is_empty() {
+                            Some(self.settings.default_psk.as_str())
+                        } else {
+                            None
+                        }
+                    });
+
+                if let Some(p) = resolved_psk {
+                    let psk_str = p.to_string();
+                    d.status = ConnectionStatus::Connecting;
+                    (d.grpc_endpoint(), psk_str)
+                } else {
+                    d.status =
+                        ConnectionStatus::AuthFailed("Please enter the PSK first".to_string());
+                    return;
+                }
+            }
+            None => return,
         };
 
         let viewer_id = self.settings.viewer_id.clone();
@@ -382,7 +402,10 @@ impl NtxApp {
                         dev.port = port;
                         dev.version = version;
                     } else {
-                        let dev = Device::new(id.clone(), hostname, addresses, port, version);
+                        let mut dev = Device::new(id.clone(), hostname, addresses, port, version);
+                        if let Some(saved) = self.settings.device_psks.get(&id) {
+                            dev.psk = Some(saved.clone());
+                        }
                         self.devices.insert(id, dev);
                     }
                 }
@@ -409,6 +432,12 @@ impl NtxApp {
                         dev.status = ConnectionStatus::Connected;
                         dev.session_token = Some(session_token);
                         dev.system_info = Some(system_info);
+                        if let Some(ref psk) = dev.psk {
+                            self.settings
+                                .device_psks
+                                .insert(device_id.clone(), psk.clone());
+                            let _ = self.settings.save();
+                        }
                     }
                 }
                 AppEvent::ConnectionFailed {
@@ -535,8 +564,8 @@ impl eframe::App for NtxApp {
                 if let Some(action) = dashboard::render(ui, &mut self.dashboard_state, &devices_vec)
                 {
                     match action {
-                        DashboardAction::Connect(id) => {
-                            self.initiate_connect(&id);
+                        DashboardAction::Connect { id, psk } => {
+                            self.initiate_connect(&id, psk);
                         }
                         DashboardAction::Disconnect(id) => {
                             self.disconnect_device(&id);
@@ -583,7 +612,7 @@ impl eframe::App for NtxApp {
                                 self.disconnect_device(&dev_id);
                             }
                             DevicePanelAction::Reconnect(dev_id) => {
-                                self.initiate_connect(&dev_id);
+                                self.initiate_connect(&dev_id, None);
                             }
                         }
                     }

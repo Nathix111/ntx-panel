@@ -1,8 +1,9 @@
 use crate::state::{ConnectionStatus, Device, ManualDevice};
 use egui::{Color32, RichText, Stroke, Ui, Vec2};
+use std::collections::HashMap;
 
 pub enum DashboardAction {
-    Connect(String),
+    Connect { id: String, psk: Option<String> },
     Disconnect(String),
     OpenMonitor(String),
     OpenTerminal(String),
@@ -19,6 +20,8 @@ pub struct DashboardState {
     pub manual_address: String,
     pub manual_port: String,
     pub manual_psk: String,
+    pub device_psk_inputs: HashMap<String, String>,
+    pub show_psk_map: HashMap<String, bool>,
 }
 
 impl DashboardState {
@@ -177,7 +180,7 @@ pub fn render(
             ui.spacing_mut().item_spacing = Vec2::new(spacing, spacing);
 
             for dev in filtered_devices {
-                let card_action = render_device_card(ui, dev, card_width);
+                let card_action = render_device_card(ui, dev, card_width, state);
                 if card_action.is_some() {
                     action = card_action;
                 }
@@ -188,7 +191,12 @@ pub fn render(
     action
 }
 
-fn render_device_card(ui: &mut Ui, dev: &Device, width: f32) -> Option<DashboardAction> {
+fn render_device_card(
+    ui: &mut Ui,
+    dev: &Device,
+    width: f32,
+    state: &mut DashboardState,
+) -> Option<DashboardAction> {
     let mut action = None;
 
     let (border_color, status_text, status_color) = match &dev.status {
@@ -315,6 +323,44 @@ fn render_device_card(ui: &mut Ui, dev: &Device, width: f32) -> Option<Dashboard
         }
 
         ui.add_space(6.0);
+
+        // If not connected, show PSK input field and any auth error message
+        if !dev.status.is_connected() {
+            if let ConnectionStatus::AuthFailed(reason) = &dev.status {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("⚠ {}", reason))
+                            .color(Color32::from_rgb(231, 76, 60))
+                            .small(),
+                    );
+                });
+                ui.add_space(2.0);
+            }
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("🔑 PSK:").small().strong());
+                let show_psk = state.show_psk_map.entry(dev.id.clone()).or_insert(false);
+                let psk_input = state
+                    .device_psk_inputs
+                    .entry(dev.id.clone())
+                    .or_insert_with(|| dev.psk.clone().unwrap_or_default());
+                ui.add(
+                    egui::TextEdit::singleline(psk_input)
+                        .password(!*show_psk)
+                        .hint_text("Paste PSK key here...")
+                        .desired_width(170.0),
+                );
+                if ui
+                    .small_button(if *show_psk { "👁" } else { "🔒" })
+                    .on_hover_text(if *show_psk { "Hide key" } else { "Show key" })
+                    .clicked()
+                {
+                    *show_psk = !*show_psk;
+                }
+            });
+            ui.add_space(4.0);
+        }
+
         ui.separator();
 
         // Action Buttons
@@ -338,8 +384,17 @@ fn render_device_card(ui: &mut Ui, dev: &Device, width: f32) -> Option<Dashboard
                     ui.label("Connecting...");
                 }
                 _ => {
-                    if ui.button("🔗 Connect").clicked() {
-                        action = Some(DashboardAction::Connect(dev.id.clone()));
+                    let connect_text = if matches!(dev.status, ConnectionStatus::AuthFailed(_)) {
+                        "🔄 Retry Connect"
+                    } else {
+                        "🔗 Connect"
+                    };
+                    if ui.button(connect_text).clicked() {
+                        let entered_psk = state.device_psk_inputs.get(&dev.id).cloned();
+                        action = Some(DashboardAction::Connect {
+                            id: dev.id.clone(),
+                            psk: entered_psk,
+                        });
                     }
 
                     // For offline/discovered devices, remove option if manual
