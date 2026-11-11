@@ -117,7 +117,7 @@ fi
 
 # If still not found, download from GitHub Releases
 if [ -z "$BINARY_SRC" ]; then
-    NTX_REPO="${NTX_REPO:-Nath-11/ntx-panel}"
+    NTX_REPO="${NTX_REPO:-Nathix111/ntx-panel}"
     NTX_VERSION="${NTX_VERSION:-latest}"
 
     if [ "$NTX_VERSION" = "latest" ]; then
