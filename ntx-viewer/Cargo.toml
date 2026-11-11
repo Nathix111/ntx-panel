@@ -1,0 +1,33 @@
+[package]
+name = "ntx-viewer"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ntx-viewer"
+path = "src/main.rs"
+
+[dependencies]
+ntx-proto = { path = "../ntx-proto" }
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+mdns-sd = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+
+# GUI
+eframe = "0.31"
+egui = "0.31"
+egui_extras = { version = "0.31", features = ["image"] }
+
+# Graphiques pour le monitoring
+egui_plot = "0.31"
