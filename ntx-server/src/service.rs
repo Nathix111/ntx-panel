@@ -189,6 +189,12 @@ pub fn uninstall(purge: bool) -> Result<()> {
                 }
             }
 
+            let helper_path = std::path::Path::new("/usr/local/bin/ntx-uninstall");
+            if helper_path.exists() {
+                let _ = std::fs::remove_file(helper_path);
+                println!("Deleted {}", helper_path.display());
+            }
+
             for dir in purge_config_directories() {
                 if dir.exists() {
                     if let Err(e) = std::fs::remove_dir_all(&dir) {

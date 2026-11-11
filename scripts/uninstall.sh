@@ -45,12 +45,26 @@ if [ -f "$UNIT_FILE" ]; then
     fi
 fi
 
-# 5. Remove binary
+# 5. Remove binaries and uninstall helper
 BIN_PATH="/usr/local/bin/ntx-server"
 if [ -f "$BIN_PATH" ]; then
     echo "==> Removing binary ($BIN_PATH)..."
     $SUDO rm -f "$BIN_PATH"
 fi
+
+UNINSTALL_HELPER="/usr/local/bin/ntx-uninstall"
+if [ -f "$UNINSTALL_HELPER" ]; then
+    echo "==> Removing uninstall helper ($UNINSTALL_HELPER)..."
+    $SUDO rm -f "$UNINSTALL_HELPER"
+fi
+
+# Clean up any leftover archive or extracted files in current directory if present
+for residual in "ntx-server" "ntx-server-linux-aarch64.tar.gz" "ntx-server-linux-x86_64.tar.gz"; do
+    if [ -f "./$residual" ]; then
+        echo "==> Removing local artifact ./$residual..."
+        $SUDO rm -f "./$residual"
+    fi
+done
 
 # 6. Wipe configuration directories
 echo "==> Purging configuration directories..."
