@@ -5,6 +5,7 @@ pub enum TerminalAction {
     BackToDashboard,
     SendData(Vec<u8>),
     Clear,
+    Reconnect,
 }
 
 pub fn render(ui: &mut Ui, device: &mut Device) -> Option<TerminalAction> {
@@ -26,6 +27,22 @@ pub fn render(ui: &mut Ui, device: &mut Device) -> Option<TerminalAction> {
             }
 
             if ui
+                .button("🔄 Reconnect")
+                .on_hover_text("Restart terminal session")
+                .clicked()
+            {
+                action = Some(TerminalAction::Reconnect);
+            }
+
+            if ui
+                .button("⏏ Ctrl+D")
+                .on_hover_text("Send EOF (0x04)")
+                .clicked()
+            {
+                action = Some(TerminalAction::SendData(vec![0x04]));
+            }
+
+            if ui
                 .button("⏹ Ctrl+C")
                 .on_hover_text("Send SIGINT (0x03)")
                 .clicked()
@@ -44,7 +61,7 @@ pub fn render(ui: &mut Ui, device: &mut Device) -> Option<TerminalAction> {
     ui.separator();
 
     // Terminal Screen Area
-    let avail_height = ui.available_height() - 42.0;
+    let avail_height = (ui.available_height() - 48.0).max(120.0);
 
     egui::Frame::canvas(ui.style())
         .fill(Color32::from_rgb(18, 18, 20))
@@ -85,7 +102,7 @@ pub fn render(ui: &mut Ui, device: &mut Device) -> Option<TerminalAction> {
                         });
                     }
 
-                    // Render active line (in-progress output)
+                    // Render active line (in-progress output / shell prompt)
                     if !device.terminal.current_spans.is_empty() {
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
@@ -146,6 +163,12 @@ pub fn render(ui: &mut Ui, device: &mut Device) -> Option<TerminalAction> {
             }
         }
 
+        let is_windows = device
+            .system_info
+            .as_ref()
+            .map(|i| i.os_name.to_lowercase().contains("win"))
+            .unwrap_or(false);
+
         let input_resp = ui.add(
             egui::TextEdit::singleline(&mut device.terminal.input_buffer)
                 .font(egui::TextStyle::Monospace)
@@ -161,17 +184,18 @@ pub fn render(ui: &mut Ui, device: &mut Device) -> Option<TerminalAction> {
             || send_clicked
         {
             let cmd = std::mem::take(&mut device.terminal.input_buffer);
+            let newline: &[u8] = if is_windows { b"\r\n" } else { b"\n" };
+
             if !cmd.trim().is_empty() {
                 device.terminal.history.push(cmd.clone());
                 device.terminal.history_idx = None;
 
-                // Send command followed by CRLF to PTY
                 let mut data = cmd.into_bytes();
-                data.extend_from_slice(b"\r\n");
+                data.extend_from_slice(newline);
                 action = Some(TerminalAction::SendData(data));
             } else {
-                // Just send enter
-                action = Some(TerminalAction::SendData(b"\r\n".to_vec()));
+                // Send lone newline to get prompt
+                action = Some(TerminalAction::SendData(newline.to_vec()));
             }
 
             input_resp.request_focus();

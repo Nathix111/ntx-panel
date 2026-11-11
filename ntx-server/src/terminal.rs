@@ -27,14 +27,40 @@ pub async fn handle_open_terminal(
     let cmd = if cfg!(windows) {
         CommandBuilder::new("cmd.exe")
     } else {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        CommandBuilder::new(shell)
+        let shell_path = if std::path::Path::new("/bin/bash").exists() {
+            "/bin/bash"
+        } else if std::path::Path::new("/usr/bin/bash").exists() {
+            "/usr/bin/bash"
+        } else {
+            "/bin/sh"
+        };
+        let mut builder = CommandBuilder::new(shell_path);
+        // Force interactive shell mode so bash loads prompt and handles input correctly
+        builder.arg("-i");
+        builder.env("TERM", "xterm-256color");
+        builder.env("COLORTERM", "truecolor");
+        builder.env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| {
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
+            }),
+        );
+        if let Ok(home) = std::env::var("HOME") {
+            builder.env("HOME", home);
+        } else {
+            builder.env("HOME", "/root");
+        }
+        builder.env("SHELL", shell_path);
+        builder
     };
 
     let mut child = pair
         .slave
         .spawn_command(cmd)
         .map_err(|e| Status::internal(format!("Failed to spawn shell process: {}", e)))?;
+
+    // Close slave in the parent process on Unix so EOF and signals function properly
+    drop(pair.slave);
 
     let mut reader = pair
         .master

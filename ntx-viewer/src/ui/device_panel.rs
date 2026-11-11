@@ -126,12 +126,19 @@ pub fn render(ui: &mut Ui, device: &Device) -> Option<DevicePanelAction> {
                 let line = Line::new(PlotPoints::new(points))
                     .name("CPU %")
                     .color(Color32::from_rgb(0, 200, 255))
+                    .fill(0.0_f32)
                     .width(2.0_f32);
 
                 Plot::new("cpu_graph")
                     .height(180.0)
+                    .include_x(-60.0)
+                    .include_x(0.0)
                     .include_y(0.0)
                     .include_y(100.0)
+                    .allow_zoom(false)
+                    .allow_drag(false)
+                    .allow_scroll(false)
+                    .allow_boxed_zoom(false)
                     .legend(Legend::default().position(Corner::RightTop))
                     .show(ui, |plot_ui| {
                         plot_ui.line(line);
@@ -173,12 +180,19 @@ pub fn render(ui: &mut Ui, device: &Device) -> Option<DevicePanelAction> {
                 let line = Line::new(PlotPoints::new(points))
                     .name("RAM %")
                     .color(Color32::from_rgb(180, 100, 240))
+                    .fill(0.0_f32)
                     .width(2.0_f32);
 
                 Plot::new("ram_graph")
                     .height(180.0)
+                    .include_x(-60.0)
+                    .include_x(0.0)
                     .include_y(0.0)
                     .include_y(100.0)
+                    .allow_zoom(false)
+                    .allow_drag(false)
+                    .allow_scroll(false)
+                    .allow_boxed_zoom(false)
                     .legend(Legend::default().position(Corner::RightTop))
                     .show(ui, |plot_ui| {
                         plot_ui.line(line);
@@ -227,6 +241,7 @@ pub fn render(ui: &mut Ui, device: &Device) -> Option<DevicePanelAction> {
         let rx_line = Line::new(PlotPoints::new(rx_points))
             .name("Download (KB/s)")
             .color(Color32::from_rgb(46, 204, 113))
+            .fill(0.0_f32)
             .width(2.0_f32);
 
         let tx_line = Line::new(PlotPoints::new(tx_points))
@@ -236,7 +251,14 @@ pub fn render(ui: &mut Ui, device: &Device) -> Option<DevicePanelAction> {
 
         Plot::new("net_graph")
             .height(140.0)
+            .include_x(-60.0)
+            .include_x(0.0)
             .include_y(0.0)
+            .include_y(10.0)
+            .allow_zoom(false)
+            .allow_drag(false)
+            .allow_scroll(false)
+            .allow_boxed_zoom(false)
             .legend(Legend::default().position(Corner::RightTop))
             .show(ui, |plot_ui| {
                 plot_ui.line(rx_line);

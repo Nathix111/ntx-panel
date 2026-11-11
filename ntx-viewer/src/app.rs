@@ -717,6 +717,11 @@ impl eframe::App for NtxApp {
                                 }
                             }
                             TerminalAction::Clear => {}
+                            TerminalAction::Reconnect => {
+                                self.terminal_txs.remove(&id_clone);
+                                dev.terminal.clear();
+                                self.open_terminal_session(&id_clone);
+                            }
                         }
                     }
                 } else {

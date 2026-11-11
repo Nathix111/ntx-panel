@@ -119,29 +119,55 @@ impl TerminalBuffer {
         let mut cur_text = String::new();
 
         while let Some(c) = chars.next() {
-            if c == '\x1b' && chars.peek() == Some(&'[') {
-                // Flush pending text with current style
-                if !cur_text.is_empty() {
-                    let text = std::mem::take(&mut cur_text);
-                    self.current_spans.push(TerminalSpan::new(
-                        text,
-                        self.current_color,
-                        self.current_bold,
-                    ));
-                }
+            if c == '\x1b' {
+                // Peek next char to distinguish CSI (\x1b[), OSC (\x1b]), etc.
+                match chars.peek() {
+                    Some(&'[') => {
+                        // CSI sequence
+                        chars.next(); // consume '['
+                        if !cur_text.is_empty() {
+                            let text = std::mem::take(&mut cur_text);
+                            self.current_spans.push(TerminalSpan::new(
+                                text,
+                                self.current_color,
+                                self.current_bold,
+                            ));
+                        }
 
-                // Consume '['
-                chars.next();
-
-                // Read parameters until terminating letter
-                let mut param_str = String::new();
-                while let Some(&next_c) = chars.peek() {
-                    if next_c.is_ascii_alphabetic() {
-                        let cmd = chars.next().unwrap();
-                        self.handle_csi_sequence(&param_str, cmd);
-                        break;
-                    } else {
-                        param_str.push(chars.next().unwrap());
+                        let mut param_str = String::new();
+                        while let Some(&next_c) = chars.peek() {
+                            if next_c.is_ascii_alphabetic() || next_c == '@' || next_c == '`' {
+                                let cmd = chars.next().unwrap();
+                                self.handle_csi_sequence(&param_str, cmd);
+                                break;
+                            } else {
+                                param_str.push(chars.next().unwrap());
+                            }
+                        }
+                    }
+                    Some(&']') => {
+                        // OSC sequence (e.g. \x1b]0;Title\x07)
+                        chars.next(); // consume ']'
+                        while let Some(osc_c) = chars.next() {
+                            if osc_c == '\x07' || (osc_c == '\x1b' && chars.peek() == Some(&'\\')) {
+                                if osc_c == '\x1b' {
+                                    chars.next(); // consume '\\'
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    Some(&'(') | Some(&')') => {
+                        // Character set selection (e.g. \x1b(B)
+                        chars.next();
+                        let _ = chars.next();
+                    }
+                    Some(&'=') | Some(&'>') => {
+                        // Keypad mode
+                        chars.next();
+                    }
+                    _ => {
+                        // Other escape sequence or bare \x1b, ignore
                     }
                 }
             } else if c == '\n' {
@@ -161,23 +187,24 @@ impl TerminalBuffer {
                     self.lines.remove(0);
                 }
             } else if c == '\r' {
-                // Carriage return: ignore if followed by \n, or could reset line
+                // If followed by \n, \n will handle newline.
+                // If lone \r (carriage return), reset active line text.
                 if chars.peek() == Some(&'\n') {
-                    // let \n handle it
+                    // Let '\n' handle line termination
                 } else {
-                    // soft CR: flush text
-                    if !cur_text.is_empty() {
-                        let text = std::mem::take(&mut cur_text);
-                        self.current_spans.push(TerminalSpan::new(
-                            text,
-                            self.current_color,
-                            self.current_bold,
-                        ));
-                    }
+                    cur_text.clear();
+                    self.current_spans.clear();
+                }
+            } else if c == '\x08' || c == '\x7f' {
+                // Backspace: pop last character
+                if !cur_text.is_empty() {
+                    cur_text.pop();
+                } else if let Some(last) = self.current_spans.last_mut() {
+                    last.text.pop();
                 }
             } else if c == '\t' {
                 cur_text.push_str("    ");
-            } else {
+            } else if c >= ' ' {
                 cur_text.push(c);
             }
         }
@@ -194,43 +221,57 @@ impl TerminalBuffer {
     }
 
     fn handle_csi_sequence(&mut self, params: &str, cmd: char) {
-        if cmd == 'm' {
-            // SGR (Select Graphic Rendition)
-            if params.is_empty() || params == "0" {
-                self.current_color = [220, 220, 220];
-                self.current_bold = false;
-                return;
-            }
+        match cmd {
+            'm' => {
+                // SGR (Select Graphic Rendition)
+                if params.is_empty() || params == "0" {
+                    self.current_color = [220, 220, 220];
+                    self.current_bold = false;
+                    return;
+                }
 
-            for part in params.split(';') {
-                match part.parse::<u32>().unwrap_or(0) {
-                    0 => {
-                        self.current_color = [220, 220, 220];
-                        self.current_bold = false;
+                for part in params.split(';') {
+                    match part.parse::<u32>().unwrap_or(0) {
+                        0 => {
+                            self.current_color = [220, 220, 220];
+                            self.current_bold = false;
+                        }
+                        1 => self.current_bold = true,
+                        22 => self.current_bold = false,
+                        // Standard foreground colors
+                        30 => self.current_color = [30, 30, 30],
+                        31 => self.current_color = [230, 70, 70],
+                        32 => self.current_color = [70, 200, 70],
+                        33 => self.current_color = [230, 200, 50],
+                        34 => self.current_color = [80, 140, 240],
+                        35 => self.current_color = [200, 80, 200],
+                        36 => self.current_color = [60, 200, 220],
+                        37 => self.current_color = [220, 220, 220],
+                        // High-intensity foreground colors
+                        90 => self.current_color = [120, 120, 120],
+                        91 => self.current_color = [255, 100, 100],
+                        92 => self.current_color = [100, 255, 100],
+                        93 => self.current_color = [255, 255, 100],
+                        94 => self.current_color = [120, 170, 255],
+                        95 => self.current_color = [255, 120, 255],
+                        96 => self.current_color = [100, 240, 255],
+                        97 => self.current_color = [255, 255, 255],
+                        _ => {}
                     }
-                    1 => self.current_bold = true,
-                    22 => self.current_bold = false,
-                    // Standard foreground colors
-                    30 => self.current_color = [30, 30, 30], // Black
-                    31 => self.current_color = [230, 70, 70], // Red
-                    32 => self.current_color = [70, 200, 70], // Green
-                    33 => self.current_color = [230, 200, 50], // Yellow
-                    34 => self.current_color = [80, 140, 240], // Blue
-                    35 => self.current_color = [200, 80, 200], // Magenta
-                    36 => self.current_color = [60, 200, 220], // Cyan
-                    37 => self.current_color = [220, 220, 220], // White
-                    // High-intensity foreground colors
-                    90 => self.current_color = [120, 120, 120], // Bright Black (Gray)
-                    91 => self.current_color = [255, 100, 100], // Bright Red
-                    92 => self.current_color = [100, 255, 100], // Bright Green
-                    93 => self.current_color = [255, 255, 100], // Bright Yellow
-                    94 => self.current_color = [120, 170, 255], // Bright Blue
-                    95 => self.current_color = [255, 120, 255], // Bright Magenta
-                    96 => self.current_color = [100, 240, 255], // Bright Cyan
-                    97 => self.current_color = [255, 255, 255], // Bright White
-                    _ => {}
                 }
             }
+            'J' => {
+                // 2J = Clear screen
+                if params.contains('2') {
+                    self.lines.clear();
+                    self.current_spans.clear();
+                }
+            }
+            'K' => {
+                // Erase in line
+                self.current_spans.clear();
+            }
+            _ => {}
         }
     }
 }
