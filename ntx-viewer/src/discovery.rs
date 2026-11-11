@@ -22,13 +22,17 @@ pub enum DiscoveryEvent {
 }
 
 pub struct DiscoveryHandle {
-    _daemon: Option<ServiceDaemon>,
+    daemon: Option<ServiceDaemon>,
     is_running: Arc<AtomicBool>,
 }
 
 impl DiscoveryHandle {
-    pub fn stop(&self) {
+    pub fn stop(&mut self) {
         self.is_running.store(false, Ordering::Relaxed);
+        if let Some(daemon) = self.daemon.take() {
+            let _ = daemon.stop_browse(NTX_SERVICE_TYPE);
+            let _ = daemon.shutdown();
+        }
     }
 }
 
@@ -102,7 +106,7 @@ pub fn start_discovery(
     });
 
     Ok(DiscoveryHandle {
-        _daemon: Some(daemon),
+        daemon: Some(daemon),
         is_running,
     })
 }
@@ -121,7 +125,7 @@ mod tests {
             let (tx, _rx) = mpsc::channel(16);
             let res = start_discovery(tx, handle);
             assert!(res.is_ok(), "start_discovery should succeed without a tokio reactor on the current thread");
-            let disc = res.unwrap();
+            let mut disc = res.unwrap();
             disc.stop();
         });
 

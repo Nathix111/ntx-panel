@@ -342,6 +342,18 @@ impl Device {
     }
 }
 
+/// A known device cached across application restarts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KnownDevice {
+    pub id: String,
+    pub hostname: String,
+    pub addresses: Vec<String>,
+    pub port: u16,
+    pub version: String,
+    #[serde(default)]
+    pub psk: Option<String>,
+}
+
 /// A manually configured device.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManualDevice {
@@ -361,6 +373,8 @@ pub struct AppSettings {
     pub dark_mode: bool,
     pub device_psks: HashMap<String, String>,
     pub manual_devices: Vec<ManualDevice>,
+    #[serde(default)]
+    pub known_devices: Vec<KnownDevice>,
 }
 
 impl Default for AppSettings {
@@ -373,6 +387,7 @@ impl Default for AppSettings {
             dark_mode: true,
             device_psks: HashMap::new(),
             manual_devices: Vec::new(),
+            known_devices: Vec::new(),
         }
     }
 }

@@ -93,7 +93,24 @@ impl NtxApp {
             metrics_cancel_txs: HashMap::new(),
         };
 
-        // Load any saved manual devices from settings
+        // 1. Load any saved known devices from settings (persisted across restarts)
+        for known in &app.settings.known_devices.clone() {
+            let mut dev = Device::new(
+                known.id.clone(),
+                known.hostname.clone(),
+                known.addresses.clone(),
+                known.port,
+                known.version.clone(),
+            );
+            dev.psk = known
+                .psk
+                .clone()
+                .or_else(|| app.settings.device_psks.get(&known.id).cloned());
+            dev.status = ConnectionStatus::Disconnected;
+            app.devices.insert(known.id.clone(), dev);
+        }
+
+        // 2. Load any saved manual devices from settings
         for manual in &app.settings.manual_devices.clone() {
             app.add_manual_device(manual.clone());
         }
@@ -101,21 +118,58 @@ impl NtxApp {
         app
     }
 
+    fn save_known_devices(&mut self) {
+        self.settings.known_devices = self
+            .devices
+            .values()
+            .map(|d| crate::state::KnownDevice {
+                id: d.id.clone(),
+                hostname: d.hostname.clone(),
+                addresses: d.addresses.clone(),
+                port: d.port,
+                version: d.version.clone(),
+                psk: d.psk.clone(),
+            })
+            .collect();
+        let _ = self.settings.save();
+    }
+
     fn add_manual_device(&mut self, manual: ManualDevice) {
-        let id = format!("{}:{}", manual.address, manual.port);
-        let mut dev = Device::new(
-            id.clone(),
-            manual.hostname,
-            vec![manual.address],
-            manual.port,
-            "manual".to_string(),
-        );
-        dev.psk = manual.psk;
-        self.devices.insert(id, dev);
+        let existing_id = self.devices.iter().find_map(|(id, d)| {
+            if d.port == manual.port
+                && (d.addresses.iter().any(|a| a == &manual.address)
+                    || d.hostname.eq_ignore_ascii_case(&manual.hostname))
+            {
+                Some(id.clone())
+            } else {
+                None
+            }
+        });
+
+        if let Some(id) = existing_id {
+            if let Some(dev) = self.devices.get_mut(&id) {
+                dev.hostname = manual.hostname;
+                if manual.psk.is_some() {
+                    dev.psk = manual.psk;
+                }
+            }
+        } else {
+            let id = format!("{}:{}", manual.address, manual.port);
+            let mut dev = Device::new(
+                id.clone(),
+                manual.hostname,
+                vec![manual.address],
+                manual.port,
+                "manual".to_string(),
+            );
+            dev.psk = manual.psk;
+            self.devices.insert(id, dev);
+        }
+        self.save_known_devices();
     }
 
     fn restart_discovery(&mut self) {
-        if let Some(handle) = self.discovery_handle.take() {
+        if let Some(mut handle) = self.discovery_handle.take() {
             handle.stop();
         }
 
@@ -396,18 +450,41 @@ impl NtxApp {
                     port,
                     version,
                 }) => {
-                    let id = fullname.clone();
-                    if let Some(dev) = self.devices.get_mut(&id) {
-                        dev.addresses = addresses;
-                        dev.port = port;
-                        dev.version = version;
+                    // Check if an existing device matches by ID, or by IP+port, or by hostname+port
+                    let existing_id = self.devices.iter().find_map(|(id, d)| {
+                        if id == &fullname {
+                            return Some(id.clone());
+                        }
+                        if d.port == port {
+                            if d.hostname.eq_ignore_ascii_case(&hostname) {
+                                return Some(id.clone());
+                            }
+                            if d.addresses.iter().any(|a| addresses.contains(a)) {
+                                return Some(id.clone());
+                            }
+                        }
+                        None
+                    });
+
+                    if let Some(id) = existing_id {
+                        if let Some(dev) = self.devices.get_mut(&id) {
+                            dev.hostname = hostname;
+                            dev.addresses = addresses;
+                            dev.port = port;
+                            dev.version = version;
+                            if dev.status == ConnectionStatus::Disconnected {
+                                dev.status = ConnectionStatus::Discovered;
+                            }
+                        }
                     } else {
+                        let id = fullname.clone();
                         let mut dev = Device::new(id.clone(), hostname, addresses, port, version);
                         if let Some(saved) = self.settings.device_psks.get(&id) {
                             dev.psk = Some(saved.clone());
                         }
                         self.devices.insert(id, dev);
                     }
+                    self.save_known_devices();
                 }
                 DiscoveryEvent::Removed(fullname) => {
                     if let Some(dev) = self.devices.get_mut(&fullname) {
@@ -585,10 +662,11 @@ impl eframe::App for NtxApp {
                         DashboardAction::RemoveDevice(id) => {
                             self.disconnect_device(&id);
                             self.devices.remove(&id);
+                            self.settings.device_psks.remove(&id);
                             self.settings
                                 .manual_devices
                                 .retain(|m| format!("{}:{}", m.address, m.port) != id);
-                            let _ = self.settings.save();
+                            self.save_known_devices();
                         }
                         DashboardAction::RefreshDiscovery => {
                             self.restart_discovery();
