@@ -81,7 +81,10 @@ WantedBy=multi-user.target
             let _ = Command::new("systemctl")
                 .args(["enable", "--now", "ntx-server.service"])
                 .output();
-            println!("Systemd unit installed and enabled!");
+            let _ = Command::new("systemctl")
+                .args(["restart", "ntx-server.service"])
+                .output();
+            println!("Systemd unit installed and service restarted!");
         }
 
         if let Ok((config, _)) = crate::config::load_or_create() {

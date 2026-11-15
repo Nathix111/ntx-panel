@@ -558,7 +558,7 @@ impl NtxApp {
                     let _ = event_tx
                         .send(AppEvent::ProcessesFailed {
                             device_id: dev_id,
-                            error: format!("ListProcesses failed: {e}"),
+                            error: format!("ListProcesses failed: {e:#}"),
                         })
                         .await;
                 }
@@ -620,7 +620,7 @@ impl NtxApp {
                     let _ = event_tx
                         .send(AppEvent::ServicesFailed {
                             device_id: dev_id,
-                            error: format!("ListServices failed: {e}"),
+                            error: format!("ListServices failed: {e:#}"),
                         })
                         .await;
                 }
@@ -686,7 +686,7 @@ impl NtxApp {
                             pid,
                             signal,
                             success: false,
-                            error: format!("KillProcess failed: {e}"),
+                            error: format!("KillProcess failed: {e:#}"),
                         })
                         .await;
                 }
@@ -754,7 +754,7 @@ impl NtxApp {
                             service_name: s_name,
                             action: act,
                             success: false,
-                            error: format!("ControlService failed: {e}"),
+                            error: format!("ControlService failed: {e:#}"),
                         })
                         .await;
                 }

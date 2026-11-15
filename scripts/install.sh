@@ -193,6 +193,8 @@ fi
 if command -v systemctl >/dev/null 2>&1; then
     echo "==> Registering systemd service..."
     $SUDO /usr/local/bin/ntx-server install
+    $SUDO systemctl daemon-reload || true
+    $SUDO systemctl restart ntx-server.service || true
 else
     echo "Notice: systemctl not found; skipping automatic service registration."
     echo "You can launch ntx-server directly by running: /usr/local/bin/ntx-server run"

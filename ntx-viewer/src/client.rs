@@ -155,7 +155,15 @@ impl NtxClient {
             .client
             .list_processes(req)
             .await
-            .context("ListProcesses RPC failed")?
+            .map_err(|status| {
+                if status.code() == tonic::Code::Unimplemented {
+                    anyhow::anyhow!(
+                        "La méthode RPC n'est pas supportée par l'agent distant (Unimplemented). L'agent ntx-server doit être mis à jour en v0.1.3+ et redémarré (sudo systemctl restart ntx-server)."
+                    )
+                } else {
+                    anyhow::anyhow!("ListProcesses RPC failed: {status}")
+                }
+            })?
             .into_inner();
         Ok(resp.processes)
     }
@@ -171,7 +179,15 @@ impl NtxClient {
             .client
             .kill_process(req)
             .await
-            .context("KillProcess RPC failed")?
+            .map_err(|status| {
+                if status.code() == tonic::Code::Unimplemented {
+                    anyhow::anyhow!(
+                        "La méthode RPC n'est pas supportée par l'agent distant (Unimplemented). L'agent ntx-server doit être mis à jour en v0.1.3+."
+                    )
+                } else {
+                    anyhow::anyhow!("KillProcess RPC failed: {status}")
+                }
+            })?
             .into_inner();
         Ok(resp)
     }
@@ -183,7 +199,15 @@ impl NtxClient {
             .client
             .list_services(req)
             .await
-            .context("ListServices RPC failed")?
+            .map_err(|status| {
+                if status.code() == tonic::Code::Unimplemented {
+                    anyhow::anyhow!(
+                        "La méthode RPC n'est pas supportée par l'agent distant (Unimplemented). L'agent ntx-server doit être mis à jour en v0.1.3+ et redémarré (sudo systemctl restart ntx-server)."
+                    )
+                } else {
+                    anyhow::anyhow!("ListServices RPC failed: {status}")
+                }
+            })?
             .into_inner();
         Ok(resp.services)
     }
@@ -202,7 +226,15 @@ impl NtxClient {
             .client
             .control_service(req)
             .await
-            .context("ControlService RPC failed")?
+            .map_err(|status| {
+                if status.code() == tonic::Code::Unimplemented {
+                    anyhow::anyhow!(
+                        "La méthode RPC n'est pas supportée par l'agent distant (Unimplemented). L'agent ntx-server doit être mis à jour en v0.1.3+."
+                    )
+                } else {
+                    anyhow::anyhow!("ControlService RPC failed: {status}")
+                }
+            })?
             .into_inner();
         Ok(resp)
     }
