@@ -129,6 +129,7 @@ message ProcessItem {
     string user = 5;
     string status = 6;
     string command_line = 7;
+    uint32 parent_pid = 8;
 }
 
 message ListProcessesRequest {}

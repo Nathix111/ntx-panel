@@ -334,6 +334,7 @@ mod tests {
                     user: "root".to_string(),
                     status: "Running".to_string(),
                     command_line: "/usr/bin/daemon-service --config /etc/daemon.conf".to_string(),
+                    parent_pid: 0,
                 },
                 ProcessItem {
                     pid: 202,
@@ -343,6 +344,7 @@ mod tests {
                     user: "app".to_string(),
                     status: "Sleeping".to_string(),
                     command_line: "/opt/worker-task".to_string(),
+                    parent_pid: 101,
                 },
             ];
             Ok(Response::new(ListProcessesResponse { processes }))

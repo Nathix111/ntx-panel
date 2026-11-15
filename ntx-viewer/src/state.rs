@@ -314,6 +314,76 @@ pub enum ProcessSubTab {
     Services,
 }
 
+/// Display mode for the process list (flat list or hierarchical tree).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProcessViewMode {
+    #[default]
+    Tree,
+    Flat,
+}
+
+/// Category filter for processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProcessFilterCategory {
+    #[default]
+    All,
+    ActiveOnly,
+    UserOnly,
+    SystemOnly,
+}
+
+/// Category filter for services.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ServiceFilterCategory {
+    #[default]
+    All,
+    ActiveOnly,
+    InactiveOnly,
+    FailedOnly,
+}
+
+/// Smart ranking of process statuses: "Run" / "Running" processes come first.
+pub fn process_status_rank(status: &str) -> u8 {
+    let s = status.to_lowercase();
+    if s.contains("run") {
+        0
+    } else if s.contains("sleep") || s.contains("idle") || s.contains("waking") || s.contains("parked") {
+        1
+    } else if s.contains("stop") || s.contains("tracing") {
+        2
+    } else if s.contains("zombie") || s.contains("dead") || s.contains("defunct") {
+        3
+    } else {
+        4
+    }
+}
+
+/// Smart ranking of systemd service states: active/running come first.
+pub fn service_state_rank(state: &str) -> u8 {
+    let s = state.to_lowercase();
+    if s == "active" || s == "running" {
+        0
+    } else if s == "failed" {
+        1
+    } else if s == "inactive" || s == "dead" {
+        2
+    } else {
+        3
+    }
+}
+
+/// A row rendered in the process tree view
+#[derive(Debug, Clone)]
+pub struct ProcessTreeRow<'a> {
+    pub item: &'a ntx_proto::ProcessItem,
+    pub depth: usize,
+    pub has_children: bool,
+    pub is_collapsed: bool,
+    pub children_count: usize,
+    pub total_cpu: f32,
+    pub total_memory: u64,
+}
+
 /// State for caching processes, services, filter search queries, and sort parameters.
 #[derive(Debug, Clone)]
 pub struct ProcessState {
@@ -325,6 +395,12 @@ pub struct ProcessState {
     pub process_sort_direction: SortDirection,
     pub service_sort_column: ServiceSortColumn,
     pub service_sort_direction: SortDirection,
+    pub view_mode: ProcessViewMode,
+    pub process_category: ProcessFilterCategory,
+    pub service_category: ServiceFilterCategory,
+    pub collapsed_pids: std::collections::HashSet<u32>,
+    pub selected_pid: Option<u32>,
+    pub is_paused: bool,
     pub auto_refresh: bool,
     pub auto_refresh_interval_secs: u64,
     pub last_process_refresh: Option<Instant>,
@@ -346,6 +422,12 @@ impl Default for ProcessState {
             process_sort_direction: SortDirection::Descending,
             service_sort_column: ServiceSortColumn::Name,
             service_sort_direction: SortDirection::Ascending,
+            view_mode: ProcessViewMode::Tree,
+            process_category: ProcessFilterCategory::All,
+            service_category: ServiceFilterCategory::All,
+            collapsed_pids: std::collections::HashSet::new(),
+            selected_pid: None,
+            is_paused: false,
             auto_refresh: false,
             auto_refresh_interval_secs: 3,
             last_process_refresh: None,
@@ -370,6 +452,88 @@ impl ProcessState {
 
     pub fn clear_status(&mut self) {
         self.status_message = None;
+    }
+
+    /// Toggle collapsing of a process PID in tree view
+    pub fn toggle_collapse(&mut self, pid: u32) {
+        if self.collapsed_pids.contains(&pid) {
+            self.collapsed_pids.remove(&pid);
+        } else {
+            self.collapsed_pids.insert(pid);
+        }
+    }
+
+    /// Expand all process trees
+    pub fn expand_all(&mut self) {
+        self.collapsed_pids.clear();
+    }
+
+    /// Collapse all processes that have children
+    pub fn collapse_all(&mut self) {
+        for p in &self.processes {
+            if self.processes.iter().any(|child| child.parent_pid == p.pid && child.pid != p.pid) {
+                self.collapsed_pids.insert(p.pid);
+            }
+        }
+    }
+
+    /// Process counts: (total, running, sleeping, zombies)
+    pub fn process_counts(&self) -> (usize, usize, usize, usize) {
+        let total = self.processes.len();
+        let mut running = 0;
+        let mut sleeping = 0;
+        let mut zombies = 0;
+
+        for p in &self.processes {
+            let s = p.status.to_lowercase();
+            if s.contains("run") {
+                running += 1;
+            } else if s.contains("sleep") || s.contains("idle") || s.contains("waking") {
+                sleeping += 1;
+            } else if s.contains("zombie") || s.contains("dead") || s.contains("defunct") {
+                zombies += 1;
+            }
+        }
+
+        (total, running, sleeping, zombies)
+    }
+
+    /// Top CPU consuming process
+    pub fn top_cpu_process(&self) -> Option<(String, f32)> {
+        self.processes
+            .iter()
+            .max_by(|a, b| a.cpu_usage.partial_cmp(&b.cpu_usage).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|p| (p.name.clone(), p.cpu_usage))
+    }
+
+    /// Top memory consuming process
+    pub fn top_mem_process(&self) -> Option<(String, u64)> {
+        self.processes
+            .iter()
+            .max_by_key(|p| p.memory_bytes)
+            .map(|p| (p.name.clone(), p.memory_bytes))
+    }
+
+    /// Service counts: (total, active, inactive, failed)
+    pub fn service_counts(&self) -> (usize, usize, usize, usize) {
+        let total = self.services.len();
+        let mut active = 0;
+        let mut inactive = 0;
+        let mut failed = 0;
+
+        for s in &self.services {
+            let st = s.active_state.to_lowercase();
+            let sub = s.sub_state.to_lowercase();
+            if st == "active" || sub == "running" {
+                active += 1;
+            } else if st == "failed" || sub == "failed" {
+                failed += 1;
+            } else if st == "inactive" || sub == "dead" {
+                inactive += 1;
+            }
+        }
+
+        (total, active, inactive, failed)
     }
 
     /// Toggle or change sorting for processes
@@ -408,6 +572,29 @@ impl ProcessState {
             .processes
             .iter()
             .filter(|p| {
+                // Category filter
+                match self.process_category {
+                    ProcessFilterCategory::All => {}
+                    ProcessFilterCategory::ActiveOnly => {
+                        if p.cpu_usage <= 0.05 {
+                            return false;
+                        }
+                    }
+                    ProcessFilterCategory::UserOnly => {
+                        let u = p.user.to_lowercase();
+                        if u == "root" || u == "system" || u.contains("daemon") {
+                            return false;
+                        }
+                    }
+                    ProcessFilterCategory::SystemOnly => {
+                        let u = p.user.to_lowercase();
+                        if u != "root" && u != "system" && !u.contains("daemon") {
+                            return false;
+                        }
+                    }
+                }
+
+                // Text search query filter
                 if q.is_empty() {
                     return true;
                 }
@@ -430,7 +617,9 @@ impl ProcessState {
                     .unwrap_or(std::cmp::Ordering::Equal),
                 ProcessSortColumn::Memory => a.memory_bytes.cmp(&b.memory_bytes),
                 ProcessSortColumn::Status => {
-                    a.status.to_lowercase().cmp(&b.status.to_lowercase())
+                    let rank_a = process_status_rank(&a.status);
+                    let rank_b = process_status_rank(&b.status);
+                    rank_a.cmp(&rank_b).then_with(|| a.status.to_lowercase().cmp(&b.status.to_lowercase()))
                 }
                 ProcessSortColumn::CommandLine => a
                     .command_line
@@ -446,6 +635,98 @@ impl ProcessState {
         list
     }
 
+    /// Build hierarchical rows for the process tree view
+    pub fn build_tree_rows(&self) -> Vec<ProcessTreeRow<'_>> {
+        let processes = self.filtered_processes();
+        if self.view_mode == ProcessViewMode::Flat {
+            return processes
+                .into_iter()
+                .map(|p| ProcessTreeRow {
+                    item: p,
+                    depth: 0,
+                    has_children: false,
+                    is_collapsed: false,
+                    children_count: 0,
+                    total_cpu: p.cpu_usage,
+                    total_memory: p.memory_bytes,
+                })
+                .collect();
+        }
+
+        use std::collections::{HashMap, HashSet};
+        let mut children_map: HashMap<u32, Vec<&ntx_proto::ProcessItem>> = HashMap::new();
+        let mut pid_set: HashSet<u32> = HashSet::new();
+
+        for p in &processes {
+            pid_set.insert(p.pid);
+        }
+
+        for p in &processes {
+            if p.parent_pid > 0 && pid_set.contains(&p.parent_pid) && p.parent_pid != p.pid {
+                children_map.entry(p.parent_pid).or_default().push(p);
+            }
+        }
+
+        fn calc_tree_totals(
+            p: &ntx_proto::ProcessItem,
+            children_map: &HashMap<u32, Vec<&ntx_proto::ProcessItem>>,
+        ) -> (f32, u64, usize) {
+            let mut cpu = p.cpu_usage;
+            let mut mem = p.memory_bytes;
+            let mut count = 0;
+            if let Some(children) = children_map.get(&p.pid) {
+                count += children.len();
+                for child in children {
+                    let (c_cpu, c_mem, c_count) = calc_tree_totals(child, children_map);
+                    cpu += c_cpu;
+                    mem += c_mem;
+                    count += c_count;
+                }
+            }
+            (cpu, mem, count)
+        }
+
+        fn push_tree_node<'a>(
+            p: &'a ntx_proto::ProcessItem,
+            depth: usize,
+            collapsed_pids: &HashSet<u32>,
+            children_map: &HashMap<u32, Vec<&'a ntx_proto::ProcessItem>>,
+            out: &mut Vec<ProcessTreeRow<'a>>,
+        ) {
+            let (total_cpu, total_mem, total_children) = calc_tree_totals(p, children_map);
+            let has_children = total_children > 0;
+            let is_collapsed = collapsed_pids.contains(&p.pid);
+
+            out.push(ProcessTreeRow {
+                item: p,
+                depth,
+                has_children,
+                is_collapsed,
+                children_count: total_children,
+                total_cpu,
+                total_memory: total_mem,
+            });
+
+            if has_children && !is_collapsed {
+                if let Some(children) = children_map.get(&p.pid) {
+                    for child in children {
+                        push_tree_node(child, depth + 1, collapsed_pids, children_map, out);
+                    }
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        for p in &processes {
+            let is_root = p.parent_pid == 0 || !pid_set.contains(&p.parent_pid) || p.parent_pid == p.pid;
+            if is_root {
+                push_tree_node(p, 0, &self.collapsed_pids, &children_map, &mut out);
+            }
+        }
+
+        out
+    }
+
     /// Get sorted and filtered slice of services
     pub fn filtered_services(&self) -> Vec<&ntx_proto::ServiceItem> {
         let q = self.service_filter.trim().to_lowercase();
@@ -453,6 +734,33 @@ impl ProcessState {
             .services
             .iter()
             .filter(|s| {
+                // Category filter
+                match self.service_category {
+                    ServiceFilterCategory::All => {}
+                    ServiceFilterCategory::ActiveOnly => {
+                        let st = s.active_state.to_lowercase();
+                        let sub = s.sub_state.to_lowercase();
+                        if st != "active" && sub != "running" {
+                            return false;
+                        }
+                    }
+                    ServiceFilterCategory::InactiveOnly => {
+                        let st = s.active_state.to_lowercase();
+                        let sub = s.sub_state.to_lowercase();
+                        if st != "inactive" && sub != "dead" {
+                            return false;
+                        }
+                    }
+                    ServiceFilterCategory::FailedOnly => {
+                        let st = s.active_state.to_lowercase();
+                        let sub = s.sub_state.to_lowercase();
+                        if st != "failed" && sub != "failed" {
+                            return false;
+                        }
+                    }
+                }
+
+                // Text search query filter
                 if q.is_empty() {
                     return true;
                 }
@@ -471,7 +779,9 @@ impl ProcessState {
                     a.description.to_lowercase().cmp(&b.description.to_lowercase())
                 }
                 ServiceSortColumn::ActiveState => {
-                    a.active_state.to_lowercase().cmp(&b.active_state.to_lowercase())
+                    let rank_a = service_state_rank(&a.active_state);
+                    let rank_b = service_state_rank(&b.active_state);
+                    rank_a.cmp(&rank_b).then_with(|| a.active_state.to_lowercase().cmp(&b.active_state.to_lowercase()))
                 }
                 ServiceSortColumn::SubState => {
                     a.sub_state.to_lowercase().cmp(&b.sub_state.to_lowercase())
@@ -810,6 +1120,7 @@ mod tests {
                 user: "root".to_string(),
                 status: "running".to_string(),
                 command_line: "/sbin/init".to_string(),
+                parent_pid: 0,
             },
             ntx_proto::ProcessItem {
                 pid: 200,
@@ -819,6 +1130,7 @@ mod tests {
                 user: "user".to_string(),
                 status: "sleeping".to_string(),
                 command_line: "/opt/google/chrome".to_string(),
+                parent_pid: 100,
             },
             ntx_proto::ProcessItem {
                 pid: 300,
@@ -828,6 +1140,7 @@ mod tests {
                 user: "root".to_string(),
                 status: "running".to_string(),
                 command_line: "./ntx-server".to_string(),
+                parent_pid: 100,
             },
         ];
 
@@ -914,6 +1227,7 @@ mod tests {
                 user: "alice".to_string(),
                 status: "Running".to_string(),
                 command_line: "b_proc --arg1".to_string(),
+                parent_pid: 0,
             },
             ntx_proto::ProcessItem {
                 pid: 2,
@@ -923,6 +1237,7 @@ mod tests {
                 user: "bob".to_string(),
                 status: "Sleeping".to_string(),
                 command_line: "a_proc --arg2".to_string(),
+                parent_pid: 0,
             },
         ];
 
@@ -936,7 +1251,7 @@ mod tests {
         let list = state.filtered_processes();
         assert_eq!(list[0].user, "alice");
 
-        // Sort by Status
+        // Sort by Status (Run prioritized over Sleeping)
         state.toggle_process_sort(ProcessSortColumn::Status);
         let list = state.filtered_processes();
         assert_eq!(list[0].status, "Running");
@@ -945,6 +1260,173 @@ mod tests {
         state.toggle_process_sort(ProcessSortColumn::CommandLine);
         let list = state.filtered_processes();
         assert_eq!(list[0].name, "a_proc");
+    }
+
+    #[test]
+    fn test_process_status_rank_smart_sorting() {
+        assert_eq!(process_status_rank("Running"), 0);
+        assert_eq!(process_status_rank("Run"), 0);
+        assert_eq!(process_status_rank("Sleep"), 1);
+        assert_eq!(process_status_rank("Idle"), 1);
+        assert_eq!(process_status_rank("Stop"), 2);
+        assert_eq!(process_status_rank("Zombie"), 3);
+
+        let mut state = ProcessState::default();
+        state.processes = vec![
+            ntx_proto::ProcessItem {
+                pid: 10,
+                name: "zombie_proc".to_string(),
+                cpu_usage: 0.0,
+                memory_bytes: 0,
+                user: "root".to_string(),
+                status: "Zombie".to_string(),
+                command_line: "zombie".to_string(),
+                parent_pid: 0,
+            },
+            ntx_proto::ProcessItem {
+                pid: 20,
+                name: "running_proc".to_string(),
+                cpu_usage: 5.0,
+                memory_bytes: 1000,
+                user: "root".to_string(),
+                status: "Run".to_string(),
+                command_line: "running".to_string(),
+                parent_pid: 0,
+            },
+            ntx_proto::ProcessItem {
+                pid: 30,
+                name: "sleep_proc".to_string(),
+                cpu_usage: 0.0,
+                memory_bytes: 1000,
+                user: "root".to_string(),
+                status: "Sleep".to_string(),
+                command_line: "sleeping".to_string(),
+                parent_pid: 0,
+            },
+        ];
+
+        state.process_sort_column = ProcessSortColumn::Status;
+        state.process_sort_direction = SortDirection::Ascending;
+        let sorted = state.filtered_processes();
+        // Priority: Run (rank 0) -> Sleep (rank 1) -> Zombie (rank 3)
+        assert_eq!(sorted[0].pid, 20);
+        assert_eq!(sorted[1].pid, 30);
+        assert_eq!(sorted[2].pid, 10);
+    }
+
+    #[test]
+    fn test_tree_hierarchy_and_collapse() {
+        let mut state = ProcessState::default();
+        state.processes = vec![
+            ntx_proto::ProcessItem {
+                pid: 1,
+                name: "init".to_string(),
+                cpu_usage: 1.0,
+                memory_bytes: 100,
+                user: "root".to_string(),
+                status: "Run".to_string(),
+                command_line: "/sbin/init".to_string(),
+                parent_pid: 0,
+            },
+            ntx_proto::ProcessItem {
+                pid: 10,
+                name: "worker".to_string(),
+                cpu_usage: 2.0,
+                memory_bytes: 200,
+                user: "root".to_string(),
+                status: "Run".to_string(),
+                command_line: "/usr/bin/worker".to_string(),
+                parent_pid: 1,
+            },
+            ntx_proto::ProcessItem {
+                pid: 100,
+                name: "subworker".to_string(),
+                cpu_usage: 3.0,
+                memory_bytes: 300,
+                user: "root".to_string(),
+                status: "Run".to_string(),
+                command_line: "/usr/bin/subworker".to_string(),
+                parent_pid: 10,
+            },
+        ];
+
+        // Tree view: all expanded
+        let rows = state.build_tree_rows();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].item.pid, 1);
+        assert_eq!(rows[0].depth, 0);
+        assert_eq!(rows[0].has_children, true);
+        assert_eq!(rows[0].children_count, 2);
+        assert!((rows[0].total_cpu - 6.0).abs() < 0.001); // 1 + 2 + 3
+        assert_eq!(rows[0].total_memory, 600); // 100 + 200 + 300
+
+        assert_eq!(rows[1].item.pid, 10);
+        assert_eq!(rows[1].depth, 1);
+        assert_eq!(rows[1].has_children, true);
+        assert_eq!(rows[1].children_count, 1);
+
+        assert_eq!(rows[2].item.pid, 100);
+        assert_eq!(rows[2].depth, 2);
+        assert_eq!(rows[2].has_children, false);
+
+        // Collapse node 1
+        state.toggle_collapse(1);
+        let rows_collapsed = state.build_tree_rows();
+        assert_eq!(rows_collapsed.len(), 1);
+        assert_eq!(rows_collapsed[0].item.pid, 1);
+        assert_eq!(rows_collapsed[0].is_collapsed, true);
+
+        // Expand all
+        state.expand_all();
+        let rows_expanded = state.build_tree_rows();
+        assert_eq!(rows_expanded.len(), 3);
+
+        // Flat view mode
+        state.view_mode = ProcessViewMode::Flat;
+        let flat_rows = state.build_tree_rows();
+        assert_eq!(flat_rows.len(), 3);
+        assert_eq!(flat_rows[0].depth, 0);
+    }
+
+    #[test]
+    fn test_process_and_service_counts() {
+        let mut state = ProcessState::default();
+        state.processes = vec![
+            ntx_proto::ProcessItem {
+                pid: 1,
+                name: "p1".to_string(),
+                cpu_usage: 10.0,
+                memory_bytes: 1024,
+                user: "root".to_string(),
+                status: "Run".to_string(),
+                command_line: "p1".to_string(),
+                parent_pid: 0,
+            },
+            ntx_proto::ProcessItem {
+                pid: 2,
+                name: "p2".to_string(),
+                cpu_usage: 25.0,
+                memory_bytes: 512,
+                user: "alice".to_string(),
+                status: "Sleeping".to_string(),
+                command_line: "p2".to_string(),
+                parent_pid: 0,
+            },
+        ];
+
+        let (total, running, sleeping, zombies) = state.process_counts();
+        assert_eq!(total, 2);
+        assert_eq!(running, 1);
+        assert_eq!(sleeping, 1);
+        assert_eq!(zombies, 0);
+
+        let top_cpu = state.top_cpu_process().unwrap();
+        assert_eq!(top_cpu.0, "p2");
+        assert_eq!(top_cpu.1, 25.0);
+
+        let top_mem = state.top_mem_process().unwrap();
+        assert_eq!(top_mem.0, "p1");
+        assert_eq!(top_mem.1, 1024);
     }
 
     #[test]

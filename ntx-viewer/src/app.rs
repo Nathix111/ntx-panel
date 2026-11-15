@@ -981,6 +981,7 @@ impl eframe::App for NtxApp {
                 if let Some(dev) = self.devices.get(id) {
                     if dev.status.is_connected()
                         && dev.process_state.auto_refresh
+                        && !dev.process_state.is_paused
                         && !dev.process_state.is_loading_processes
                     {
                         let should_refresh = dev

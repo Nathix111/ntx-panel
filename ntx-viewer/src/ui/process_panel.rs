@@ -1,5 +1,6 @@
 use crate::state::{
-    ProcessSortColumn, ProcessState, ProcessSubTab, ServiceSortColumn, SortDirection,
+    ProcessFilterCategory, ProcessSortColumn, ProcessState, ProcessSubTab,
+    ProcessViewMode, ServiceFilterCategory, ServiceSortColumn, SortDirection,
 };
 use egui::{Color32, RichText, Ui};
 use egui_extras::{Column, TableBuilder};
@@ -73,8 +74,19 @@ pub fn render(
                 }
             }
 
-            // Auto-refresh toggle (for processes)
+            // Process auto-refresh controls
             if state.active_subtab == ProcessSubTab::Processes {
+                if state.auto_refresh {
+                    let pause_label = if state.is_paused {
+                        "▶ Reprendre"
+                    } else {
+                        "⏸ Pause"
+                    };
+                    if ui.button(pause_label).on_hover_text("Geler/reprendre l'actualisation automatique pour inspecter").clicked() {
+                        state.is_paused = !state.is_paused;
+                    }
+                }
+
                 ui.checkbox(&mut state.auto_refresh, "⚡ Auto (3s)")
                     .on_hover_text("Actualise automatiquement la liste des processus toutes les 3 secondes");
             }
@@ -90,54 +102,7 @@ pub fn render(
 
     ui.add_space(4.0);
 
-    // 2. Search filter bar
-    ui.horizontal(|ui| {
-        ui.label("🔍");
-        match state.active_subtab {
-            ProcessSubTab::Processes => {
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.process_filter)
-                        .hint_text("Filtrer par nom, PID, utilisateur, commande...")
-                        .desired_width(280.0),
-                );
-                if !state.process_filter.is_empty() && ui.small_button("✖").clicked() {
-                    state.process_filter.clear();
-                }
-                let filtered_count = state.filtered_processes().len();
-                ui.label(
-                    RichText::new(format!(
-                        "{filtered_count} / {} processus affichés",
-                        state.processes.len()
-                    ))
-                    .weak()
-                    .size(12.0),
-                );
-            }
-            ProcessSubTab::Services => {
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.service_filter)
-                        .hint_text("Filtrer par nom de service, description...")
-                        .desired_width(280.0),
-                );
-                if !state.service_filter.is_empty() && ui.small_button("✖").clicked() {
-                    state.service_filter.clear();
-                }
-                let filtered_count = state.filtered_services().len();
-                ui.label(
-                    RichText::new(format!(
-                        "{filtered_count} / {} services affichés",
-                        state.services.len()
-                    ))
-                    .weak()
-                    .size(12.0),
-                );
-            }
-        }
-    });
-
-    ui.add_space(4.0);
-
-    // 3. Status Notification Banner (if any)
+    // 2. Status Notification Banner (if any)
     if let Some((msg, is_error)) = &state.status_message.clone() {
         let (bg, fg) = if *is_error {
             (Color32::from_rgb(70, 25, 25), Color32::from_rgb(250, 100, 100))
@@ -166,10 +131,27 @@ pub fn render(
         ui.add_space(4.0);
     }
 
-    // 4. Main Body Table
+    // 3. KPI Statistics Banner
+    match state.active_subtab {
+        ProcessSubTab::Processes => render_process_kpi_banner(ui, state),
+        ProcessSubTab::Services => render_service_kpi_banner(ui, state),
+    }
+
+    ui.add_space(4.0);
+
+    // 4. Toolbar: Search Filter, Categories & View Modes
+    render_filter_toolbar(ui, state);
+
+    ui.add_space(4.0);
+
+    // 5. Main Body Table
     match state.active_subtab {
         ProcessSubTab::Processes => {
             if let Some(act) = render_processes_table(ui, state) {
+                action = Some(act);
+            }
+            // 6. Selected Process Inspector Drawer
+            if let Some(act) = render_process_inspector(ui, state) {
                 action = Some(act);
             }
         }
@@ -183,12 +165,298 @@ pub fn render(
     action
 }
 
+// ----------------------------------------------------------------------------
+// KPI Summary Banners
+// ----------------------------------------------------------------------------
+
+fn render_process_kpi_banner(ui: &mut Ui, state: &ProcessState) {
+    if state.processes.is_empty() {
+        return;
+    }
+
+    let (total, running, sleeping, zombies) = state.process_counts();
+    let top_cpu = state.top_cpu_process();
+    let top_mem = state.top_mem_process();
+
+    egui::Frame::new()
+        .fill(Color32::from_rgb(22, 25, 32))
+        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(45, 50, 62)))
+        .corner_radius(5.0)
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("📊 Total: {total}")).strong().size(12.0));
+                ui.separator();
+
+                ui.label(
+                    RichText::new(format!("⚡ En cours: {running}"))
+                        .color(Color32::from_rgb(46, 204, 113))
+                        .strong()
+                        .size(12.0),
+                );
+                ui.separator();
+
+                ui.label(
+                    RichText::new(format!("💤 En veille: {sleeping}"))
+                        .color(Color32::from_rgb(140, 155, 170))
+                        .size(12.0),
+                );
+                ui.separator();
+
+                let zombie_color = if zombies > 0 {
+                    Color32::from_rgb(231, 76, 60)
+                } else {
+                    Color32::from_rgb(120, 130, 140)
+                };
+                ui.label(
+                    RichText::new(format!("💀 Zombies: {zombies}"))
+                        .color(zombie_color)
+                        .size(12.0),
+                );
+
+                if let Some((name, cpu)) = top_cpu {
+                    if cpu > 0.05 {
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!("🔥 Top CPU: {name} ({cpu:.1}%)"))
+                                .color(Color32::from_rgb(240, 160, 50))
+                                .size(12.0),
+                        );
+                    }
+                }
+
+                if let Some((name, mem)) = top_mem {
+                    if mem > 0 {
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!("💾 Top RAM: {name} ({})", format_ram(mem)))
+                                .color(Color32::from_rgb(100, 180, 240))
+                                .size(12.0),
+                        );
+                    }
+                }
+            });
+        });
+}
+
+fn render_service_kpi_banner(ui: &mut Ui, state: &ProcessState) {
+    if state.services.is_empty() {
+        return;
+    }
+
+    let (total, active, inactive, failed) = state.service_counts();
+
+    egui::Frame::new()
+        .fill(Color32::from_rgb(22, 25, 32))
+        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(45, 50, 62)))
+        .corner_radius(5.0)
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("📊 Total: {total}")).strong().size(12.0));
+                ui.separator();
+
+                ui.label(
+                    RichText::new(format!("🟢 Actifs: {active}"))
+                        .color(Color32::from_rgb(46, 204, 113))
+                        .strong()
+                        .size(12.0),
+                );
+                ui.separator();
+
+                ui.label(
+                    RichText::new(format!("⚪ Inactifs: {inactive}"))
+                        .color(Color32::from_rgb(140, 155, 170))
+                        .size(12.0),
+                );
+                ui.separator();
+
+                let failed_color = if failed > 0 {
+                    Color32::from_rgb(231, 76, 60)
+                } else {
+                    Color32::from_rgb(120, 130, 140)
+                };
+                ui.label(
+                    RichText::new(format!("🔴 En échec: {failed}"))
+                        .color(failed_color)
+                        .strong()
+                        .size(12.0),
+                );
+            });
+        });
+}
+
+// ----------------------------------------------------------------------------
+// Toolbar (Filters, Category Pills, View Mode)
+// ----------------------------------------------------------------------------
+
+fn render_filter_toolbar(ui: &mut Ui, state: &mut ProcessState) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("🔍");
+        match state.active_subtab {
+            ProcessSubTab::Processes => {
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.process_filter)
+                        .hint_text("Filtrer (nom, PID, utilisateur, commande...)")
+                        .desired_width(220.0),
+                );
+                if !state.process_filter.is_empty() && ui.small_button("✖").clicked() {
+                    state.process_filter.clear();
+                }
+
+                ui.separator();
+
+                // Category pills
+                if ui
+                    .selectable_label(state.process_category == ProcessFilterCategory::All, "Tous")
+                    .clicked()
+                {
+                    state.process_category = ProcessFilterCategory::All;
+                }
+                if ui
+                    .selectable_label(
+                        state.process_category == ProcessFilterCategory::ActiveOnly,
+                        "⚡ Actifs (>0%)",
+                    )
+                    .on_hover_text("Afficher uniquement les processus consommant du CPU")
+                    .clicked()
+                {
+                    state.process_category = ProcessFilterCategory::ActiveOnly;
+                }
+                if ui
+                    .selectable_label(
+                        state.process_category == ProcessFilterCategory::UserOnly,
+                        "👤 Utilisateur",
+                    )
+                    .on_hover_text("Afficher les processus non-système (hors root / daemons)")
+                    .clicked()
+                {
+                    state.process_category = ProcessFilterCategory::UserOnly;
+                }
+                if ui
+                    .selectable_label(
+                        state.process_category == ProcessFilterCategory::SystemOnly,
+                        "🛡 Système",
+                    )
+                    .on_hover_text("Afficher les processus système / root")
+                    .clicked()
+                {
+                    state.process_category = ProcessFilterCategory::SystemOnly;
+                }
+
+                ui.separator();
+
+                // View Mode (Tree vs Flat)
+                let is_tree = state.view_mode == ProcessViewMode::Tree;
+                if ui
+                    .selectable_label(is_tree, "🌲 Arborescence")
+                    .on_hover_text("Regrouper les processus enfants sous leur parent PID")
+                    .clicked()
+                {
+                    state.view_mode = ProcessViewMode::Tree;
+                }
+                if ui
+                    .selectable_label(!is_tree, "📋 Liste plate")
+                    .on_hover_text("Affichage tabulaire plat traditionnel")
+                    .clicked()
+                {
+                    state.view_mode = ProcessViewMode::Flat;
+                }
+
+                if is_tree {
+                    if ui.button("➕ Déplier tout").on_hover_text("Déplier toutes les branches de l'arbre").clicked() {
+                        state.expand_all();
+                    }
+                    if ui.button("➖ Replier tout").on_hover_text("Replier tous les processus ayant des sous-processus").clicked() {
+                        state.collapse_all();
+                    }
+                }
+
+                ui.separator();
+
+                let filtered_count = state.filtered_processes().len();
+                ui.label(
+                    RichText::new(format!(
+                        "{filtered_count}/{} affichés",
+                        state.processes.len()
+                    ))
+                    .weak()
+                    .size(11.0),
+                );
+            }
+            ProcessSubTab::Services => {
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.service_filter)
+                        .hint_text("Filtrer par nom de service, description...")
+                        .desired_width(220.0),
+                );
+                if !state.service_filter.is_empty() && ui.small_button("✖").clicked() {
+                    state.service_filter.clear();
+                }
+
+                ui.separator();
+
+                // Service category pills
+                if ui
+                    .selectable_label(state.service_category == ServiceFilterCategory::All, "Tous")
+                    .clicked()
+                {
+                    state.service_category = ServiceFilterCategory::All;
+                }
+                if ui
+                    .selectable_label(
+                        state.service_category == ServiceFilterCategory::ActiveOnly,
+                        "🟢 Actifs",
+                    )
+                    .clicked()
+                {
+                    state.service_category = ServiceFilterCategory::ActiveOnly;
+                }
+                if ui
+                    .selectable_label(
+                        state.service_category == ServiceFilterCategory::InactiveOnly,
+                        "⚪ Inactifs",
+                    )
+                    .clicked()
+                {
+                    state.service_category = ServiceFilterCategory::InactiveOnly;
+                }
+                if ui
+                    .selectable_label(
+                        state.service_category == ServiceFilterCategory::FailedOnly,
+                        "🔴 En échec",
+                    )
+                    .clicked()
+                {
+                    state.service_category = ServiceFilterCategory::FailedOnly;
+                }
+
+                ui.separator();
+
+                let filtered_count = state.filtered_services().len();
+                ui.label(
+                    RichText::new(format!(
+                        "{filtered_count}/{} affichés",
+                        state.services.len()
+                    ))
+                    .weak()
+                    .size(11.0),
+                );
+            }
+        }
+    });
+}
+
 fn sort_indicator(direction: SortDirection) -> &'static str {
     match direction {
         SortDirection::Ascending => " ▲",
         SortDirection::Descending => " ▼",
     }
 }
+
+// ----------------------------------------------------------------------------
+// Processes Table
+// ----------------------------------------------------------------------------
 
 fn render_processes_table(
     ui: &mut Ui,
@@ -212,24 +480,27 @@ fn render_processes_table(
 
     let mut action: Option<ProcessPanelAction> = None;
     let mut sort_to_toggle: Option<ProcessSortColumn> = None;
+    let mut collapse_to_toggle: Option<u32> = None;
+    let mut pid_to_select: Option<Option<u32>> = None;
 
     let active_col = state.process_sort_column;
     let active_dir = state.process_sort_direction;
 
-    // Filter and sort items
-    let processes = state.filtered_processes();
+    // Build tree or flat rows
+    let tree_rows = state.build_tree_rows();
+    let is_tree_mode = state.view_mode == ProcessViewMode::Tree;
 
     TableBuilder::new(ui)
         .striped(true)
         .resizable(true)
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-        .column(Column::initial(70.0).at_least(50.0))  // PID
-        .column(Column::initial(160.0).at_least(100.0)) // Name
-        .column(Column::initial(90.0).at_least(60.0))   // User
-        .column(Column::initial(75.0).at_least(60.0))   // CPU %
-        .column(Column::initial(90.0).at_least(70.0))   // RAM MB
-        .column(Column::initial(80.0).at_least(60.0))   // Status
-        .column(Column::remainder().at_least(150.0))    // Command Line
+        .column(Column::initial(70.0).at_least(50.0))   // PID
+        .column(Column::initial(220.0).at_least(140.0)) // Nom (with tree indent)
+        .column(Column::initial(85.0).at_least(60.0))   // Utilisateur
+        .column(Column::initial(105.0).at_least(85.0))  // CPU % + mini gauge
+        .column(Column::initial(90.0).at_least(70.0))   // RAM
+        .column(Column::initial(85.0).at_least(60.0))   // Statut
+        .column(Column::remainder().at_least(140.0))    // Ligne de commande
         .column(Column::exact(130.0))                   // Actions
         .header(24.0, |mut header| {
             header.col(|ui| {
@@ -331,17 +602,63 @@ fn render_processes_table(
             });
         })
         .body(|body| {
-            body.rows(26.0, processes.len(), |mut row| {
-                let proc = processes[row.index()];
+            body.rows(26.0, tree_rows.len(), |mut row| {
+                let tree_row = &tree_rows[row.index()];
+                let proc = tree_row.item;
+                let is_selected = state.selected_pid == Some(proc.pid);
 
                 // Col 0: PID
                 row.col(|ui| {
-                    ui.label(RichText::new(proc.pid.to_string()).weak());
+                    let pid_text = if is_selected {
+                        RichText::new(proc.pid.to_string()).color(Color32::from_rgb(100, 200, 255)).strong()
+                    } else {
+                        RichText::new(proc.pid.to_string()).weak()
+                    };
+                    let resp = ui.selectable_label(is_selected, pid_text);
+                    if resp.clicked() {
+                        pid_to_select = Some(if is_selected { None } else { Some(proc.pid) });
+                    }
+                    if proc.parent_pid > 0 {
+                        resp.on_hover_text(format!("PID: {}\nPPID (parent): {}", proc.pid, proc.parent_pid));
+                    }
                 });
 
-                // Col 1: Name
+                // Col 1: Name + Tree indentation & expand/collapse chevron
                 row.col(|ui| {
-                    ui.label(RichText::new(&proc.name).strong());
+                    ui.horizontal(|ui| {
+                        if is_tree_mode {
+                            // Tree indent space
+                            if tree_row.depth > 0 {
+                                ui.add_space(tree_row.depth as f32 * 14.0);
+                            }
+
+                            // Fold/unfold toggle button if has children
+                            if tree_row.has_children {
+                                let chevron = if tree_row.is_collapsed {
+                                    format!("▶ ({})", tree_row.children_count)
+                                } else {
+                                    format!("▼ ({})", tree_row.children_count)
+                                };
+                                if ui.small_button(RichText::new(chevron).size(10.0)).on_hover_text("Déplier / replier les processus enfants").clicked() {
+                                    collapse_to_toggle = Some(proc.pid);
+                                }
+                            } else if tree_row.depth > 0 {
+                                ui.label(RichText::new("└─").weak().size(11.0));
+                            }
+                        }
+
+                        let name_label = if is_selected {
+                            RichText::new(&proc.name).color(Color32::from_rgb(100, 200, 255)).strong()
+                        } else {
+                            RichText::new(&proc.name).strong()
+                        };
+
+                        let resp = ui.selectable_label(is_selected, name_label);
+                        if resp.clicked() {
+                            pid_to_select = Some(if is_selected { None } else { Some(proc.pid) });
+                        }
+                        resp.on_hover_text(format!("{} (PID: {})\nCliquer pour inspecter", proc.name, proc.pid));
+                    });
                 });
 
                 // Col 2: User
@@ -350,46 +667,49 @@ fn render_processes_table(
                     ui.label(RichText::new(user_display).weak().size(12.0));
                 });
 
-                // Col 3: CPU %
+                // Col 3: CPU % + Visual gauge bar
                 row.col(|ui| {
-                    let cpu_color = if proc.cpu_usage > 50.0 {
-                        Color32::from_rgb(255, 90, 90)
-                    } else if proc.cpu_usage > 15.0 {
-                        Color32::from_rgb(255, 180, 50)
-                    } else {
-                        Color32::from_rgb(180, 220, 180)
-                    };
-                    ui.label(
-                        RichText::new(format!("{:.1}%", proc.cpu_usage))
-                            .color(cpu_color)
-                            .strong(),
-                    );
+                    render_cpu_bar(ui, proc.cpu_usage);
+                    if tree_row.is_collapsed && tree_row.has_children {
+                        ui.label(
+                            RichText::new(format!("Σ{:.1}%", tree_row.total_cpu))
+                                .size(10.0)
+                                .weak(),
+                        )
+                        .on_hover_text(format!("Total avec {} enfants: {:.1}%", tree_row.children_count, tree_row.total_cpu));
+                    }
                 });
 
                 // Col 4: RAM
                 row.col(|ui| {
-                    let mb = proc.memory_bytes as f64 / (1024.0 * 1024.0);
-                    let mem_str = if mb >= 1024.0 {
-                        format!("{:.2} Go", mb / 1024.0)
-                    } else {
-                        format!("{:.1} Mo", mb)
-                    };
+                    let mem_str = format_ram(proc.memory_bytes);
                     ui.label(RichText::new(mem_str).size(12.0));
+                    if tree_row.is_collapsed && tree_row.has_children {
+                        ui.label(
+                            RichText::new(format!("Σ{}", format_ram(tree_row.total_memory)))
+                                .size(10.0)
+                                .weak(),
+                        )
+                        .on_hover_text(format!("Total avec {} enfants: {}", tree_row.children_count, format_ram(tree_row.total_memory)));
+                    }
                 });
 
                 // Col 5: Status
                 row.col(|ui| {
                     let st = proc.status.to_lowercase();
-                    let color = if st.contains("run") {
-                        Color32::from_rgb(46, 204, 113)
+                    let (badge_text, color) = if st.contains("run") {
+                        ("● Run", Color32::from_rgb(46, 204, 113))
                     } else if st.contains("sleep") || st.contains("idle") {
-                        Color32::from_rgb(140, 150, 160)
-                    } else if st.contains("stop") || st.contains("zomb") {
-                        Color32::from_rgb(231, 76, 60)
+                        ("○ Sleep", Color32::from_rgb(140, 150, 160))
+                    } else if st.contains("stop") {
+                        ("■ Stop", Color32::from_rgb(240, 160, 40))
+                    } else if st.contains("zomb") || st.contains("dead") {
+                        ("✕ Zombie", Color32::from_rgb(231, 76, 60))
                     } else {
-                        Color32::from_rgb(200, 200, 200)
+                        ("◌ Autre", Color32::from_rgb(180, 180, 180))
                     };
-                    ui.label(RichText::new(&proc.status).color(color).size(12.0));
+                    ui.label(RichText::new(badge_text).color(color).size(11.0).strong())
+                        .on_hover_text(&proc.status);
                 });
 
                 // Col 6: Command Line
@@ -441,8 +761,143 @@ fn render_processes_table(
         state.toggle_process_sort(col);
     }
 
+    if let Some(pid) = collapse_to_toggle {
+        state.toggle_collapse(pid);
+    }
+
+    if let Some(pid_opt) = pid_to_select {
+        state.selected_pid = pid_opt;
+    }
+
     action
 }
+
+// ----------------------------------------------------------------------------
+// Process Inspector Drawer (Bottom Panel for selected process)
+// ----------------------------------------------------------------------------
+
+fn render_process_inspector(
+    ui: &mut Ui,
+    state: &mut ProcessState,
+) -> Option<ProcessPanelAction> {
+    let pid = state.selected_pid?;
+    let proc = state.processes.iter().find(|p| p.pid == pid)?.clone();
+
+    let mut action: Option<ProcessPanelAction> = None;
+    let mut close_inspector = false;
+    let mut select_parent_pid: Option<u32> = None;
+
+    ui.add_space(6.0);
+
+    egui::Frame::new()
+        .fill(Color32::from_rgb(20, 24, 30))
+        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(60, 75, 100)))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            // Header bar
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("🔍 Inspecteur: {} (PID: {})", proc.name, proc.pid))
+                        .strong()
+                        .size(14.0)
+                        .color(Color32::from_rgb(100, 200, 255)),
+                );
+
+                if proc.parent_pid > 0 {
+                    ui.label(RichText::new(format!("PPID: {}", proc.parent_pid)).weak().size(12.0));
+                    if ui.small_button("Inspecter parent").on_hover_text("Basculer vers le processus parent").clicked() {
+                        select_parent_pid = Some(proc.parent_pid);
+                    }
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("✖ Fermer").clicked() {
+                        close_inspector = true;
+                    }
+                });
+            });
+
+            ui.add_space(4.0);
+
+            // Metrics badges row
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("Utilisateur: {}", if proc.user.is_empty() { "-" } else { &proc.user })).weak().size(12.0));
+                ui.separator();
+                ui.label(RichText::new(format!("Statut: {}", proc.status)).weak().size(12.0));
+                ui.separator();
+                ui.label(RichText::new(format!("CPU: {:.1}%", proc.cpu_usage)).strong().size(12.0).color(Color32::from_rgb(240, 160, 50)));
+                ui.separator();
+                ui.label(RichText::new(format!("Mémoire: {}", format_ram(proc.memory_bytes))).strong().size(12.0).color(Color32::from_rgb(100, 180, 240)));
+            });
+
+            ui.add_space(4.0);
+
+            // Full command line
+            let cmd_text = if proc.command_line.is_empty() {
+                proc.name.clone()
+            } else {
+                proc.command_line.clone()
+            };
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Ligne de commande:").weak().size(11.0));
+                if ui.small_button("📋 Copier").on_hover_text("Copier la ligne de commande complète dans le presse-papier").clicked() {
+                    ui.ctx().copy_text(cmd_text.clone());
+                    state.set_status("Ligne de commande copiée dans le presse-papier.", false);
+                }
+            });
+
+            egui::Frame::new()
+                .fill(Color32::from_rgb(12, 14, 18))
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(&cmd_text).monospace().size(11.0).color(Color32::from_rgb(200, 210, 225)));
+                });
+
+            ui.add_space(4.0);
+
+            // Direct actions
+            ui.horizontal(|ui| {
+                if ui
+                    .button("⏹ Arrêter (SIGTERM 15)")
+                    .on_hover_text("Demande polie de terminaison propre")
+                    .clicked()
+                {
+                    action = Some(ProcessPanelAction::KillProcess {
+                        pid: proc.pid,
+                        signal: 15,
+                    });
+                }
+
+                if ui
+                    .button(RichText::new("🛑 Forcer l'arrêt (SIGKILL 9)").color(Color32::from_rgb(255, 100, 100)))
+                    .on_hover_text("Arrêt forcé et immédiat du processus par le noyau")
+                    .clicked()
+                {
+                    action = Some(ProcessPanelAction::KillProcess {
+                        pid: proc.pid,
+                        signal: 9,
+                    });
+                }
+            });
+        });
+
+    if close_inspector {
+        state.selected_pid = None;
+    }
+
+    if let Some(ppid) = select_parent_pid {
+        state.selected_pid = Some(ppid);
+    }
+
+    action
+}
+
+// ----------------------------------------------------------------------------
+// Services Table
+// ----------------------------------------------------------------------------
 
 fn render_services_table(
     ui: &mut Ui,
@@ -687,4 +1142,41 @@ fn render_services_table(
     }
 
     action
+}
+
+// ----------------------------------------------------------------------------
+// Visual Helpers
+// ----------------------------------------------------------------------------
+
+fn render_cpu_bar(ui: &mut Ui, cpu: f32) {
+    let fraction = (cpu / 100.0).clamp(0.0, 1.0);
+    let color = if cpu >= 50.0 {
+        Color32::from_rgb(235, 75, 75)
+    } else if cpu >= 15.0 {
+        Color32::from_rgb(240, 160, 40)
+    } else if cpu > 0.05 {
+        Color32::from_rgb(46, 204, 113)
+    } else {
+        Color32::from_rgb(120, 130, 140)
+    };
+
+    ui.horizontal(|ui| {
+        let (rect, _response) = ui.allocate_exact_size(egui::vec2(28.0, 7.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 2.0, Color32::from_rgb(35, 38, 46));
+        if fraction > 0.0 {
+            let filled_width = (rect.width() * fraction).max(2.0);
+            let filled_rect = egui::Rect::from_min_size(rect.min, egui::vec2(filled_width, rect.height()));
+            ui.painter().rect_filled(filled_rect, 2.0, color);
+        }
+        ui.label(RichText::new(format!("{cpu:.1}%")).color(color).strong().size(11.0));
+    });
+}
+
+fn format_ram(bytes: u64) -> String {
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    if mb >= 1024.0 {
+        format!("{:.2} Go", mb / 1024.0)
+    } else {
+        format!("{:.1} Mo", mb)
+    }
 }

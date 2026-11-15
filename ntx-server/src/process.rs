@@ -25,6 +25,8 @@ pub async fn list_processes() -> Vec<ProcessItem> {
             .or_else(|| proc.user_id().map(|u| u.to_string()))
             .unwrap_or_default();
 
+        let parent_pid = proc.parent().map(|p| p.as_u32()).unwrap_or(0);
+
         items.push(ProcessItem {
             pid: pid.as_u32(),
             name: proc.name().to_string_lossy().to_string(),
@@ -33,6 +35,7 @@ pub async fn list_processes() -> Vec<ProcessItem> {
             user,
             status: format!("{:?}", proc.status()),
             command_line: cmd,
+            parent_pid,
         });
     }
 
