@@ -880,6 +880,149 @@ impl ProcessState {
     }
 }
 
+/// Type of favorite application or workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FavoriteAppType {
+    #[default]
+    Process,
+    Docker,
+    Service,
+    Custom,
+}
+
+impl FavoriteAppType {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            FavoriteAppType::Process => "Process",
+            FavoriteAppType::Docker => "Docker",
+            FavoriteAppType::Service => "Service",
+            FavoriteAppType::Custom => "Custom",
+        }
+    }
+}
+
+/// A favorite application or workload pinned for quick access and monitoring.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FavoriteApp {
+    pub id: String,
+    pub name: String,
+    pub icon: String,
+    pub app_type: FavoriteAppType,
+    pub process_filter: String,
+    pub service_name: Option<String>,
+    pub terminal_command: String,
+    pub description: String,
+    pub auto_start_command: Option<String>,
+}
+
+impl Default for FavoriteApp {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            icon: "⭐".to_string(),
+            app_type: FavoriteAppType::Process,
+            process_filter: String::new(),
+            service_name: None,
+            terminal_command: String::new(),
+            description: String::new(),
+            auto_start_command: None,
+        }
+    }
+}
+
+impl FavoriteApp {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        icon: impl Into<String>,
+        app_type: FavoriteAppType,
+        process_filter: impl Into<String>,
+        service_name: Option<String>,
+        terminal_command: impl Into<String>,
+        description: impl Into<String>,
+        auto_start_command: Option<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            icon: icon.into(),
+            app_type,
+            process_filter: process_filter.into(),
+            service_name,
+            terminal_command: terminal_command.into(),
+            description: description.into(),
+            auto_start_command,
+        }
+    }
+
+    /// Check whether this favorite application matches a running process.
+    /// Matches against process name, command line, or numeric PID if the filter parses as a number.
+    pub fn matches_process(&self, p: &ntx_proto::ProcessItem) -> bool {
+        let filter = self.process_filter.trim();
+        let query = if !filter.is_empty() {
+            filter
+        } else {
+            self.name.trim()
+        };
+
+        if query.is_empty() {
+            return false;
+        }
+
+        // Numeric PID matching
+        if let Ok(pid) = query.parse::<u32>() {
+            if p.pid == pid {
+                return true;
+            }
+        }
+
+        let q_lower = query.to_lowercase();
+        p.name.to_lowercase().contains(&q_lower)
+            || p.command_line.to_lowercase().contains(&q_lower)
+    }
+
+    /// Check whether this favorite application matches a system service.
+    /// Matches against service name (with or without .service suffix) or description.
+    pub fn matches_service(&self, s: &ntx_proto::ServiceItem) -> bool {
+        let query = self
+            .service_name
+            .as_deref()
+            .map(|sn| sn.trim())
+            .filter(|sn| !sn.is_empty())
+            .unwrap_or_else(|| {
+                if !self.process_filter.trim().is_empty() {
+                    self.process_filter.trim()
+                } else {
+                    self.name.trim()
+                }
+            });
+
+        if query.is_empty() {
+            return false;
+        }
+
+        let q_lower = query.to_lowercase();
+        let s_lower = s.name.to_lowercase();
+
+        // Exact match
+        if s_lower == q_lower {
+            return true;
+        }
+
+        // Normalized matching without .service suffix
+        let s_base = s_lower.strip_suffix(".service").unwrap_or(&s_lower);
+        let q_base = q_lower.strip_suffix(".service").unwrap_or(&q_lower);
+        if s_base == q_base {
+            return true;
+        }
+
+        // Substring matching on service name or description
+        s_lower.contains(&q_lower) || s.description.to_lowercase().contains(&q_lower)
+    }
+}
+
 /// A remote machine managed by NTX Panel.
 #[derive(Debug, Clone)]
 pub struct Device {
@@ -902,6 +1045,8 @@ pub struct Device {
     pub terminal: TerminalBuffer,
     // Process & service manager
     pub process_state: ProcessState,
+    // Favorite applications configured for this device
+    pub favorites: Vec<FavoriteApp>,
 }
 
 impl Device {
@@ -929,6 +1074,7 @@ impl Device {
             tx_history: VecDeque::with_capacity(120),
             terminal: TerminalBuffer::new(),
             process_state: ProcessState::default(),
+            favorites: Vec::new(),
         }
     }
 
@@ -1023,7 +1169,12 @@ pub struct AppSettings {
     pub manual_devices: Vec<ManualDevice>,
     #[serde(default)]
     pub known_devices: Vec<KnownDevice>,
+    #[serde(default)]
+    pub favorite_apps: HashMap<String, Vec<FavoriteApp>>,
 }
+
+/// Type alias for `AppSettings`.
+pub type Settings = AppSettings;
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -1036,6 +1187,7 @@ impl Default for AppSettings {
             device_psks: HashMap::new(),
             manual_devices: Vec::new(),
             known_devices: Vec::new(),
+            favorite_apps: HashMap::new(),
         }
     }
 }
@@ -1435,26 +1587,26 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].item.pid, 1);
         assert_eq!(rows[0].depth, 0);
-        assert_eq!(rows[0].has_children, true);
+        assert!(rows[0].has_children);
         assert_eq!(rows[0].children_count, 2);
         assert!((rows[0].total_cpu - 6.0).abs() < 0.001); // 1 + 2 + 3
         assert_eq!(rows[0].total_memory, 600); // 100 + 200 + 300
 
         assert_eq!(rows[1].item.pid, 10);
         assert_eq!(rows[1].depth, 1);
-        assert_eq!(rows[1].has_children, true);
+        assert!(rows[1].has_children);
         assert_eq!(rows[1].children_count, 1);
 
         assert_eq!(rows[2].item.pid, 100);
         assert_eq!(rows[2].depth, 2);
-        assert_eq!(rows[2].has_children, false);
+        assert!(!rows[2].has_children);
 
         // Collapse node 1
         state.toggle_collapse(1);
         let rows_collapsed = state.build_tree_rows();
         assert_eq!(rows_collapsed.len(), 1);
         assert_eq!(rows_collapsed[0].item.pid, 1);
-        assert_eq!(rows_collapsed[0].is_collapsed, true);
+        assert!(rows_collapsed[0].is_collapsed);
 
         // Expand all
         state.expand_all();
@@ -1591,30 +1743,326 @@ mod tests {
         assert_eq!(rows.len(), 3);
         // python3 leader
         assert_eq!(rows[0].item.pid, 11); // sorted by CPU default: 11 has 10.0, 10 has 5.0
-        assert_eq!(rows[0].has_children, true);
+        assert!(rows[0].has_children);
         assert_eq!(rows[0].children_count, 1);
-        assert_eq!(rows[0].total_cpu, 15.0);
+        assert!((rows[0].total_cpu - 15.0).abs() < 0.001);
         assert_eq!(rows[0].total_memory, 250);
 
         // python3 child
         assert_eq!(rows[1].item.pid, 10);
         assert_eq!(rows[1].depth, 1);
-        assert_eq!(rows[1].has_children, false);
+        assert!(!rows[1].has_children);
 
         // standalone
         assert_eq!(rows[2].item.pid, 20);
-        assert_eq!(rows[2].has_children, false);
+        assert!(!rows[2].has_children);
 
         // Collapse python3
         state.toggle_collapse(rows[0].item.pid);
         let rows_collapsed = state.build_tree_rows();
         assert_eq!(rows_collapsed.len(), 2);
-        assert_eq!(rows_collapsed[0].is_collapsed, true);
+        assert!(rows_collapsed[0].is_collapsed);
 
         // Test collapse_all
         state.expand_all();
         assert_eq!(state.build_tree_rows().len(), 3);
         state.collapse_all();
         assert_eq!(state.build_tree_rows().len(), 2);
+    }
+
+    #[test]
+    fn test_favorite_app_matches_process() {
+        let app = FavoriteApp {
+            id: "fav-1".to_string(),
+            name: "Nginx Server".to_string(),
+            icon: "🌐".to_string(),
+            app_type: FavoriteAppType::Process,
+            process_filter: "nginx".to_string(),
+            service_name: None,
+            terminal_command: "systemctl status nginx".to_string(),
+            description: "Main reverse proxy".to_string(),
+            auto_start_command: Some("systemctl start nginx".to_string()),
+        };
+
+        // Match by process name
+        let p1 = ntx_proto::ProcessItem {
+            pid: 1001,
+            name: "nginx".to_string(),
+            cpu_usage: 1.5,
+            memory_bytes: 50 * 1024 * 1024,
+            user: "www-data".to_string(),
+            status: "running".to_string(),
+            command_line: "nginx: master process".to_string(),
+            parent_pid: 1,
+        };
+        assert!(app.matches_process(&p1));
+
+        // Match by command line
+        let p2 = ntx_proto::ProcessItem {
+            pid: 1002,
+            name: "worker".to_string(),
+            cpu_usage: 0.8,
+            memory_bytes: 20 * 1024 * 1024,
+            user: "www-data".to_string(),
+            status: "running".to_string(),
+            command_line: "/usr/sbin/nginx -g daemon off;".to_string(),
+            parent_pid: 1001,
+        };
+        assert!(app.matches_process(&p2));
+
+        // Non-matching process
+        let p3 = ntx_proto::ProcessItem {
+            pid: 2001,
+            name: "postgres".to_string(),
+            cpu_usage: 5.0,
+            memory_bytes: 200 * 1024 * 1024,
+            user: "postgres".to_string(),
+            status: "running".to_string(),
+            command_line: "/usr/lib/postgresql/bin/postgres".to_string(),
+            parent_pid: 1,
+        };
+        assert!(!app.matches_process(&p3));
+
+        // Match by PID when process_filter is a number
+        let app_pid = FavoriteApp {
+            id: "fav-pid".to_string(),
+            name: "Dedicated Worker".to_string(),
+            icon: "⚡".to_string(),
+            app_type: FavoriteAppType::Process,
+            process_filter: "1001".to_string(),
+            service_name: None,
+            terminal_command: String::new(),
+            description: String::new(),
+            auto_start_command: None,
+        };
+        assert!(app_pid.matches_process(&p1));
+        assert!(!app_pid.matches_process(&p2));
+
+        // Fallback to name when process_filter is empty
+        let app_empty_filter = FavoriteApp {
+            id: "fav-name".to_string(),
+            name: "postgres".to_string(),
+            icon: "🐘".to_string(),
+            app_type: FavoriteAppType::Process,
+            process_filter: String::new(),
+            service_name: None,
+            terminal_command: String::new(),
+            description: String::new(),
+            auto_start_command: None,
+        };
+        assert!(app_empty_filter.matches_process(&p3));
+        assert!(!app_empty_filter.matches_process(&p1));
+    }
+
+    #[test]
+    fn test_favorite_app_matches_service() {
+        let app = FavoriteApp {
+            id: "fav-svc".to_string(),
+            name: "Docker Engine".to_string(),
+            icon: "🐳".to_string(),
+            app_type: FavoriteAppType::Service,
+            process_filter: "dockerd".to_string(),
+            service_name: Some("docker.service".to_string()),
+            terminal_command: "systemctl status docker".to_string(),
+            description: "Docker daemon".to_string(),
+            auto_start_command: Some("systemctl start docker".to_string()),
+        };
+
+        // Exact match with .service
+        let s1 = ntx_proto::ServiceItem {
+            name: "docker.service".to_string(),
+            description: "Docker Application Container Engine".to_string(),
+            load_state: "loaded".to_string(),
+            active_state: "active".to_string(),
+            sub_state: "running".to_string(),
+        };
+        assert!(app.matches_service(&s1));
+
+        // Match without .service in target service item
+        let s1_short = ntx_proto::ServiceItem {
+            name: "docker".to_string(),
+            description: "Docker daemon".to_string(),
+            load_state: "loaded".to_string(),
+            active_state: "active".to_string(),
+            sub_state: "running".to_string(),
+        };
+        assert!(app.matches_service(&s1_short));
+
+        // When favorite app has service_name without .service
+        let app_short = FavoriteApp {
+            id: "fav-nginx".to_string(),
+            name: "Nginx".to_string(),
+            icon: "🌐".to_string(),
+            app_type: FavoriteAppType::Service,
+            process_filter: String::new(),
+            service_name: Some("nginx".to_string()),
+            terminal_command: String::new(),
+            description: String::new(),
+            auto_start_command: None,
+        };
+        let s2 = ntx_proto::ServiceItem {
+            name: "nginx.service".to_string(),
+            description: "A high performance web server".to_string(),
+            load_state: "loaded".to_string(),
+            active_state: "active".to_string(),
+            sub_state: "running".to_string(),
+        };
+        assert!(app_short.matches_service(&s2));
+
+        // Match by description substring
+        let s3 = ntx_proto::ServiceItem {
+            name: "web-reverse-proxy.service".to_string(),
+            description: "A high performance nginx web server and proxy".to_string(),
+            load_state: "loaded".to_string(),
+            active_state: "active".to_string(),
+            sub_state: "running".to_string(),
+        };
+        assert!(app_short.matches_service(&s3));
+
+        // Non-matching service
+        let s4 = ntx_proto::ServiceItem {
+            name: "ssh.service".to_string(),
+            description: "OpenSSH Server Daemon".to_string(),
+            load_state: "loaded".to_string(),
+            active_state: "active".to_string(),
+            sub_state: "running".to_string(),
+        };
+        assert!(!app.matches_service(&s4));
+        assert!(!app_short.matches_service(&s4));
+
+        // Fallback to process_filter / name when service_name is None
+        let app_fallback = FavoriteApp {
+            id: "fav-fb".to_string(),
+            name: "ssh".to_string(),
+            icon: "🔒".to_string(),
+            app_type: FavoriteAppType::Service,
+            process_filter: String::new(),
+            service_name: None,
+            terminal_command: String::new(),
+            description: String::new(),
+            auto_start_command: None,
+        };
+        assert!(app_fallback.matches_service(&s4));
+    }
+
+    #[test]
+    fn test_favorite_app_serialization() {
+        let app = FavoriteApp::new(
+            "app-1",
+            "PostgreSQL",
+            "🐘",
+            FavoriteAppType::Docker,
+            "postgres",
+            Some("postgres.service".to_string()),
+            "docker logs postgres",
+            "Main database instance",
+            Some("docker start postgres".to_string()),
+        );
+
+        // JSON serialization
+        let json_str = serde_json::to_string(&app).expect("JSON serialization failed");
+        let from_json: FavoriteApp = serde_json::from_str(&json_str).expect("JSON deserialization failed");
+        assert_eq!(app, from_json);
+
+        // TOML serialization
+        let toml_str = toml::to_string(&app).expect("TOML serialization failed");
+        let from_toml: FavoriteApp = toml::from_str(&toml_str).expect("TOML deserialization failed");
+        assert_eq!(app, from_toml);
+
+        // Test all enum variants
+        let types = vec![
+            FavoriteAppType::Process,
+            FavoriteAppType::Docker,
+            FavoriteAppType::Service,
+            FavoriteAppType::Custom,
+        ];
+        for t in types {
+            let s = serde_json::to_string(&t).unwrap();
+            let parsed: FavoriteAppType = serde_json::from_str(&s).unwrap();
+            assert_eq!(t, parsed);
+        }
+    }
+
+    #[test]
+    fn test_settings_favorite_apps_persistence() {
+        let mut settings = Settings::default();
+        assert!(settings.favorite_apps.is_empty());
+
+        let dev1_apps = vec![
+            FavoriteApp::new(
+                "app-1",
+                "Nginx",
+                "🌐",
+                FavoriteAppType::Service,
+                "nginx",
+                Some("nginx.service".to_string()),
+                "systemctl status nginx",
+                "Web server",
+                Some("systemctl start nginx".to_string()),
+            ),
+            FavoriteApp::new(
+                "app-2",
+                "Redis",
+                "🔴",
+                FavoriteAppType::Process,
+                "redis-server",
+                None,
+                "redis-cli ping",
+                "Cache",
+                None,
+            ),
+        ];
+
+        let dev2_apps = vec![
+            FavoriteApp::new(
+                "app-3",
+                "Docker Compose Stack",
+                "🐳",
+                FavoriteAppType::Custom,
+                "docker",
+                None,
+                "docker compose ps",
+                "Microservices stack",
+                Some("docker compose up -d".to_string()),
+            ),
+        ];
+
+        settings.favorite_apps.insert("dev-1".to_string(), dev1_apps.clone());
+        settings.favorite_apps.insert("dev-2".to_string(), dev2_apps.clone());
+
+        // Serialize to TOML
+        let toml_str = toml::to_string_pretty(&settings).expect("TOML settings serialization failed");
+        let loaded: Settings = toml::from_str(&toml_str).expect("TOML settings deserialization failed");
+
+        assert_eq!(loaded.favorite_apps.len(), 2);
+        assert_eq!(loaded.favorite_apps.get("dev-1"), Some(&dev1_apps));
+        assert_eq!(loaded.favorite_apps.get("dev-2"), Some(&dev2_apps));
+
+        // Backward compatibility: TOML without favorite_apps deserializes cleanly
+        let old_toml = r#"
+            default_psk = "old_psk"
+            viewer_id = "test_viewer"
+            refresh_rate_ms = 1000
+            history_capacity = 60
+            dark_mode = true
+            manual_devices = []
+            known_devices = []
+            [device_psks]
+        "#;
+        let backwards_compatible: Settings = toml::from_str(old_toml).expect("Backward compatibility deserialization failed");
+        assert!(backwards_compatible.favorite_apps.is_empty());
+        assert_eq!(backwards_compatible.default_psk, "old_psk");
+    }
+
+    #[test]
+    fn test_device_initializes_with_empty_favorites() {
+        let dev = Device::new(
+            "dev_id".to_string(),
+            "hostname".to_string(),
+            vec!["127.0.0.1".to_string()],
+            9850,
+            "1.0.0".to_string(),
+        );
+        assert!(dev.favorites.is_empty());
     }
 }

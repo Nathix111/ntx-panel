@@ -140,6 +140,9 @@ impl NtxApp {
                 .clone()
                 .or_else(|| app.settings.device_psks.get(&known.id).cloned());
             dev.status = ConnectionStatus::Disconnected;
+            if let Some(favs) = app.settings.favorite_apps.get(&known.id) {
+                dev.favorites = favs.clone();
+            }
             app.devices.insert(known.id.clone(), dev);
         }
 
@@ -210,6 +213,9 @@ impl NtxApp {
                 "manual".to_string(),
             );
             dev.psk = manual.psk;
+            if let Some(favs) = self.settings.favorite_apps.get(&id) {
+                dev.favorites = favs.clone();
+            }
             self.devices.insert(id.clone(), dev);
             if self.selected_device_id.is_none() {
                 self.selected_device_id = Some(id);
@@ -804,6 +810,9 @@ impl NtxApp {
                         if let Some(saved) = self.settings.device_psks.get(&id) {
                             dev.psk = Some(saved.clone());
                         }
+                        if let Some(favs) = self.settings.favorite_apps.get(&id) {
+                            dev.favorites = favs.clone();
+                        }
                         self.devices.insert(id.clone(), dev);
                         if self.selected_device_id.is_none() {
                             self.selected_device_id = Some(id);
@@ -841,7 +850,9 @@ impl NtxApp {
                             let _ = self.settings.save();
                         }
                     }
-                    if self.device_panel_state.active_tab == DeviceTab::Processes {
+                    if self.device_panel_state.active_tab == DeviceTab::Processes
+                        || self.device_panel_state.active_tab == DeviceTab::Favorites
+                    {
                         self.fetch_processes(&device_id);
                         self.fetch_services(&device_id);
                     }
@@ -1140,7 +1151,7 @@ impl eframe::App for NtxApp {
                                 self.save_known_devices();
                             }
                             DevicePanelAction::SwitchTab(tab) => {
-                                if tab == DeviceTab::Processes {
+                                if tab == DeviceTab::Processes || tab == DeviceTab::Favorites {
                                     let (need_proc, need_srv) = if let Some(d) = self.devices.get(&id) {
                                         if d.status.is_connected() {
                                             (
@@ -1182,6 +1193,86 @@ impl eframe::App for NtxApp {
                                         action,
                                     } => {
                                         self.control_service(&id, &service_name, &action);
+                                    }
+                                    ProcessPanelAction::AddFavoriteFromProcess(proc_item) => {
+                                        let ts = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_millis())
+                                            .unwrap_or(0);
+                                        let fav_id = format!("fav_{}_{ts}", proc_item.pid);
+                                        let term_cmd = if !proc_item.command_line.is_empty() {
+                                            format!("top -p {}", proc_item.pid)
+                                        } else {
+                                            String::new()
+                                        };
+                                        let fav = crate::state::FavoriteApp::new(
+                                            fav_id,
+                                            proc_item.name.clone(),
+                                            "⚡",
+                                            crate::state::FavoriteAppType::Process,
+                                            proc_item.name.clone(),
+                                            None,
+                                            term_cmd,
+                                            format!("Processus {} (PID: {})", proc_item.name, proc_item.pid),
+                                            None,
+                                        );
+
+                                        if let Some(dev) = self.devices.get_mut(&id) {
+                                            if !dev.favorites.iter().any(|f| f.process_filter == fav.process_filter) {
+                                                dev.favorites.push(fav);
+                                                self.settings.favorite_apps.insert(id.clone(), dev.favorites.clone());
+                                                let _ = self.settings.save();
+                                            }
+                                        }
+                                        self.device_panel_state.active_tab = DeviceTab::Favorites;
+                                    }
+                                }
+                            }
+                            DevicePanelAction::FavoritesAction(fav_action) => {
+                                match fav_action {
+                                    crate::ui::favorites_panel::FavoritesPanelAction::AttachTerminal { command } => {
+                                        self.device_panel_state.active_tab = DeviceTab::Terminal;
+                                        if !self.terminal_txs.contains_key(&id) {
+                                            self.open_terminal_session(&id);
+                                        }
+                                        if !command.trim().is_empty() {
+                                            if let Some(tx) = self.terminal_txs.get(&id) {
+                                                let mut cmd = command.clone();
+                                                if !cmd.ends_with('\n') && !cmd.ends_with('\r') {
+                                                    cmd.push('\n');
+                                                }
+                                                let _ = tx.try_send(TerminalInput {
+                                                    input: Some(Input::Data(cmd.into_bytes())),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    crate::ui::favorites_panel::FavoritesPanelAction::KillProcess { pid, signal } => {
+                                        self.kill_process(&id, pid, signal);
+                                    }
+                                    crate::ui::favorites_panel::FavoritesPanelAction::ControlService {
+                                        service_name,
+                                        action,
+                                    } => {
+                                        self.control_service(&id, &service_name, &action);
+                                    }
+                                    crate::ui::favorites_panel::FavoritesPanelAction::SaveFavorite(fav) => {
+                                        if let Some(dev) = self.devices.get_mut(&id) {
+                                            if let Some(pos) = dev.favorites.iter().position(|f| f.id == fav.id) {
+                                                dev.favorites[pos] = fav;
+                                            } else {
+                                                dev.favorites.push(fav);
+                                            }
+                                            self.settings.favorite_apps.insert(id.clone(), dev.favorites.clone());
+                                            let _ = self.settings.save();
+                                        }
+                                    }
+                                    crate::ui::favorites_panel::FavoritesPanelAction::RemoveFavorite(fav_id) => {
+                                        if let Some(dev) = self.devices.get_mut(&id) {
+                                            dev.favorites.retain(|f| f.id != fav_id);
+                                            self.settings.favorite_apps.insert(id.clone(), dev.favorites.clone());
+                                            let _ = self.settings.save();
+                                        }
                                     }
                                 }
                             }

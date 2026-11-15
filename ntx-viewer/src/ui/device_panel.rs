@@ -1,4 +1,5 @@
 use crate::state::{ConnectionStatus, Device};
+use crate::ui::favorites_panel::{self, FavoritesPanelAction};
 use crate::ui::process_panel::{self, ProcessPanelAction};
 use crate::ui::terminal::{self, TerminalAction};
 use egui::{Color32, ProgressBar, RichText, Ui};
@@ -8,6 +9,7 @@ use egui_plot::{Corner, Legend, Line, Plot, PlotPoints};
 pub enum DeviceTab {
     #[default]
     Metrics,
+    Favorites,
     Processes,
     Terminal,
     Config,
@@ -18,6 +20,7 @@ pub struct DevicePanelState {
     pub psk_input: String,
     pub show_psk: bool,
     pub psk_status_message: Option<String>,
+    pub favorites_state: favorites_panel::FavoritesPanelState,
 }
 
 impl Default for DevicePanelState {
@@ -27,6 +30,7 @@ impl Default for DevicePanelState {
             psk_input: String::new(),
             show_psk: false,
             psk_status_message: None,
+            favorites_state: favorites_panel::FavoritesPanelState::default(),
         }
     }
 }
@@ -40,6 +44,7 @@ pub enum DevicePanelAction {
     SwitchTab(DeviceTab),
     TerminalAction(TerminalAction),
     ProcessAction(ProcessPanelAction),
+    FavoritesAction(FavoritesPanelAction),
 }
 
 pub fn render(
@@ -158,6 +163,16 @@ pub fn render(
             action = Some(DevicePanelAction::SwitchTab(DeviceTab::Metrics));
         }
 
+        let fav_label = format!("⭐ Applications & Favoris ({})", device.favorites.len());
+        let fav_btn = ui.selectable_label(
+            state.active_tab == DeviceTab::Favorites,
+            fav_label,
+        );
+        if fav_btn.clicked() {
+            state.active_tab = DeviceTab::Favorites;
+            action = Some(DevicePanelAction::SwitchTab(DeviceTab::Favorites));
+        }
+
         let proc_btn = ui.selectable_label(
             state.active_tab == DeviceTab::Processes,
             "⚡ Processus & Services",
@@ -197,6 +212,11 @@ pub fn render(
     match state.active_tab {
         DeviceTab::Metrics => {
             render_metrics_tab(ui, device, &mut action);
+        }
+        DeviceTab::Favorites => {
+            if let Some(act) = favorites_panel::render(ui, &mut state.favorites_state, device) {
+                action = Some(DevicePanelAction::FavoritesAction(act));
+            }
         }
         DeviceTab::Processes => {
             if let Some(act) = process_panel::render(

@@ -12,6 +12,7 @@ pub enum ProcessPanelAction {
     RefreshServices,
     KillProcess { pid: u32, signal: i32 },
     ControlService { service_name: String, action: String },
+    AddFavoriteFromProcess(ntx_proto::ProcessItem),
 }
 
 /// Render the Process & Services management panel.
@@ -747,9 +748,17 @@ fn render_processes_table(
                     lbl.on_hover_text(cmd);
                 });
 
-                // Col 7: Actions (SIGTERM / SIGKILL)
+                // Col 7: Actions (SIGTERM / SIGKILL / Favori)
                 row.col(|ui| {
                     ui.horizontal(|ui| {
+                        if ui
+                            .button("⭐")
+                            .on_hover_text("Épingler ce processus dans l'onglet Applications & Favoris")
+                            .clicked()
+                        {
+                            action = Some(ProcessPanelAction::AddFavoriteFromProcess(proc.clone()));
+                        }
+
                         if ui
                             .button("Arrêter")
                             .on_hover_text("Envoyer SIGTERM (15) pour terminer le processus proprement")
@@ -879,6 +888,14 @@ fn render_process_inspector(
 
             // Direct actions
             ui.horizontal(|ui| {
+                if ui
+                    .button("⭐ Mettre en favori")
+                    .on_hover_text("Épingler ce processus dans l'onglet Applications & Favoris")
+                    .clicked()
+                {
+                    action = Some(ProcessPanelAction::AddFavoriteFromProcess(proc.clone()));
+                }
+
                 if ui
                     .button("⏹ Arrêter (SIGTERM 15)")
                     .on_hover_text("Demande polie de terminaison propre")
