@@ -625,39 +625,58 @@ fn render_processes_table(
 
                 // Col 1: Name + Tree indentation & expand/collapse chevron
                 row.col(|ui| {
-                    ui.horizontal(|ui| {
-                        if is_tree_mode {
-                            // Tree indent space
-                            if tree_row.depth > 0 {
-                                ui.add_space(tree_row.depth as f32 * 14.0);
-                            }
-
-                            // Fold/unfold toggle button if has children
-                            if tree_row.has_children {
-                                let chevron = if tree_row.is_collapsed {
-                                    format!("▶ ({})", tree_row.children_count)
-                                } else {
-                                    format!("▼ ({})", tree_row.children_count)
-                                };
-                                if ui.small_button(RichText::new(chevron).size(10.0)).on_hover_text("Déplier / replier les processus enfants").clicked() {
-                                    collapse_to_toggle = Some(proc.pid);
+                    ui.push_id(proc.pid, |ui| {
+                        ui.horizontal(|ui| {
+                            if is_tree_mode {
+                                // Tree indent space
+                                if tree_row.depth > 0 {
+                                    ui.add_space(tree_row.depth as f32 * 14.0);
                                 }
-                            } else if tree_row.depth > 0 {
-                                ui.label(RichText::new("└─").weak().size(11.0));
+
+                                // Fold/unfold toggle button if has children
+                                if tree_row.has_children {
+                                    let icon = if tree_row.is_collapsed { "▶" } else { "▼" };
+                                    let badge_label = format!("{icon} {}", tree_row.children_count);
+                                    let btn = egui::Button::new(
+                                        RichText::new(badge_label)
+                                            .size(11.0)
+                                            .strong()
+                                            .color(if tree_row.is_collapsed {
+                                                Color32::from_rgb(100, 200, 255)
+                                            } else {
+                                                Color32::from_rgb(180, 200, 220)
+                                            }),
+                                    )
+                                    .fill(if tree_row.is_collapsed {
+                                        Color32::from_rgb(32, 48, 70)
+                                    } else {
+                                        Color32::from_rgb(28, 34, 44)
+                                    })
+                                    .corner_radius(3.0);
+
+                                    if ui.add(btn).on_hover_text("Déplier / replier ce groupe (ou double-clic sur le nom)").clicked() {
+                                        collapse_to_toggle = Some(proc.pid);
+                                    }
+                                } else if tree_row.depth > 0 {
+                                    ui.label(RichText::new("└─").weak().size(11.0));
+                                }
                             }
-                        }
 
-                        let name_label = if is_selected {
-                            RichText::new(&proc.name).color(Color32::from_rgb(100, 200, 255)).strong()
-                        } else {
-                            RichText::new(&proc.name).strong()
-                        };
+                            let name_label = if is_selected {
+                                RichText::new(&proc.name).color(Color32::from_rgb(100, 200, 255)).strong()
+                            } else {
+                                RichText::new(&proc.name).strong()
+                            };
 
-                        let resp = ui.selectable_label(is_selected, name_label);
-                        if resp.clicked() {
-                            pid_to_select = Some(if is_selected { None } else { Some(proc.pid) });
-                        }
-                        resp.on_hover_text(format!("{} (PID: {})\nCliquer pour inspecter", proc.name, proc.pid));
+                            let resp = ui.selectable_label(is_selected, name_label);
+                            if resp.clicked() {
+                                pid_to_select = Some(if is_selected { None } else { Some(proc.pid) });
+                            }
+                            if resp.double_clicked() && tree_row.has_children {
+                                collapse_to_toggle = Some(proc.pid);
+                            }
+                            resp.on_hover_text(format!("{} (PID: {})\nCliquer pour inspecter\nDouble-cliquer pour déplier/replier", proc.name, proc.pid));
+                        });
                     });
                 });
 

@@ -470,10 +470,14 @@ impl ProcessState {
 
     /// Collapse all processes that have children
     pub fn collapse_all(&mut self) {
-        for p in &self.processes {
-            if self.processes.iter().any(|child| child.parent_pid == p.pid && child.pid != p.pid) {
-                self.collapsed_pids.insert(p.pid);
-            }
+        let pids: Vec<u32> = self
+            .build_tree_rows()
+            .into_iter()
+            .filter(|r| r.has_children)
+            .map(|r| r.item.pid)
+            .collect();
+        for pid in pids {
+            self.collapsed_pids.insert(pid);
         }
     }
 
@@ -654,77 +658,153 @@ impl ProcessState {
         }
 
         use std::collections::{HashMap, HashSet};
-        let mut children_map: HashMap<u32, Vec<&ntx_proto::ProcessItem>> = HashMap::new();
-        let mut pid_set: HashSet<u32> = HashSet::new();
 
-        for p in &processes {
-            pid_set.insert(p.pid);
-        }
+        let has_any_ppid = processes.iter().any(|p| p.parent_pid > 0);
 
-        for p in &processes {
-            if p.parent_pid > 0 && pid_set.contains(&p.parent_pid) && p.parent_pid != p.pid {
-                children_map.entry(p.parent_pid).or_default().push(p);
+        if has_any_ppid {
+            // Mode A: Hierarchical tree based on parent_pid
+            let mut children_map: HashMap<u32, Vec<&ntx_proto::ProcessItem>> = HashMap::new();
+            let mut pid_set: HashSet<u32> = HashSet::new();
+
+            for p in &processes {
+                pid_set.insert(p.pid);
             }
-        }
 
-        fn calc_tree_totals(
-            p: &ntx_proto::ProcessItem,
-            children_map: &HashMap<u32, Vec<&ntx_proto::ProcessItem>>,
-        ) -> (f32, u64, usize) {
-            let mut cpu = p.cpu_usage;
-            let mut mem = p.memory_bytes;
-            let mut count = 0;
-            if let Some(children) = children_map.get(&p.pid) {
-                count += children.len();
-                for child in children {
-                    let (c_cpu, c_mem, c_count) = calc_tree_totals(child, children_map);
-                    cpu += c_cpu;
-                    mem += c_mem;
-                    count += c_count;
+            for p in &processes {
+                if p.parent_pid > 0 && pid_set.contains(&p.parent_pid) && p.parent_pid != p.pid {
+                    children_map.entry(p.parent_pid).or_default().push(p);
                 }
             }
-            (cpu, mem, count)
-        }
 
-        fn push_tree_node<'a>(
-            p: &'a ntx_proto::ProcessItem,
-            depth: usize,
-            collapsed_pids: &HashSet<u32>,
-            children_map: &HashMap<u32, Vec<&'a ntx_proto::ProcessItem>>,
-            out: &mut Vec<ProcessTreeRow<'a>>,
-        ) {
-            let (total_cpu, total_mem, total_children) = calc_tree_totals(p, children_map);
-            let has_children = total_children > 0;
-            let is_collapsed = collapsed_pids.contains(&p.pid);
-
-            out.push(ProcessTreeRow {
-                item: p,
-                depth,
-                has_children,
-                is_collapsed,
-                children_count: total_children,
-                total_cpu,
-                total_memory: total_mem,
-            });
-
-            if has_children && !is_collapsed {
+            fn calc_tree_totals(
+                p: &ntx_proto::ProcessItem,
+                children_map: &HashMap<u32, Vec<&ntx_proto::ProcessItem>>,
+            ) -> (f32, u64, usize) {
+                let mut cpu = p.cpu_usage;
+                let mut mem = p.memory_bytes;
+                let mut count = 0;
                 if let Some(children) = children_map.get(&p.pid) {
+                    count += children.len();
                     for child in children {
-                        push_tree_node(child, depth + 1, collapsed_pids, children_map, out);
+                        let (c_cpu, c_mem, c_count) = calc_tree_totals(child, children_map);
+                        cpu += c_cpu;
+                        mem += c_mem;
+                        count += c_count;
+                    }
+                }
+                (cpu, mem, count)
+            }
+
+            fn push_tree_node<'a>(
+                p: &'a ntx_proto::ProcessItem,
+                depth: usize,
+                collapsed_pids: &HashSet<u32>,
+                children_map: &HashMap<u32, Vec<&'a ntx_proto::ProcessItem>>,
+                out: &mut Vec<ProcessTreeRow<'a>>,
+            ) {
+                let (total_cpu, total_mem, total_children) = calc_tree_totals(p, children_map);
+                let has_children = total_children > 0;
+                let is_collapsed = collapsed_pids.contains(&p.pid);
+
+                out.push(ProcessTreeRow {
+                    item: p,
+                    depth,
+                    has_children,
+                    is_collapsed,
+                    children_count: total_children,
+                    total_cpu,
+                    total_memory: total_mem,
+                });
+
+                if has_children && !is_collapsed {
+                    if let Some(children) = children_map.get(&p.pid) {
+                        for child in children {
+                            push_tree_node(child, depth + 1, collapsed_pids, children_map, out);
+                        }
                     }
                 }
             }
-        }
 
-        let mut out = Vec::new();
-        for p in &processes {
-            let is_root = p.parent_pid == 0 || !pid_set.contains(&p.parent_pid) || p.parent_pid == p.pid;
-            if is_root {
-                push_tree_node(p, 0, &self.collapsed_pids, &children_map, &mut out);
+            let mut out = Vec::new();
+            for p in &processes {
+                let is_root = p.parent_pid == 0 || !pid_set.contains(&p.parent_pid) || p.parent_pid == p.pid;
+                if is_root {
+                    push_tree_node(p, 0, &self.collapsed_pids, &children_map, &mut out);
+                }
             }
-        }
 
-        out
+            out
+        } else {
+            // Mode B: Fallback clustering by process name (when remote server lacks PPID support)
+            let mut name_counts: HashMap<String, usize> = HashMap::new();
+            for p in &processes {
+                *name_counts.entry(p.name.clone()).or_insert(0) += 1;
+            }
+
+            let mut seen_names: HashSet<String> = HashSet::new();
+            let mut name_children: HashMap<String, Vec<&ntx_proto::ProcessItem>> = HashMap::new();
+            let mut leaders: Vec<&ntx_proto::ProcessItem> = Vec::new();
+
+            for p in &processes {
+                let count = *name_counts.get(&p.name).unwrap_or(&1);
+                if count > 1 {
+                    if seen_names.insert(p.name.clone()) {
+                        leaders.push(p);
+                    } else {
+                        name_children.entry(p.name.clone()).or_default().push(p);
+                    }
+                } else {
+                    leaders.push(p);
+                }
+            }
+
+            let mut out = Vec::new();
+            for leader in leaders {
+                if let Some(children) = name_children.get(&leader.name) {
+                    let children_count = children.len();
+                    let has_children = children_count > 0;
+                    let is_collapsed = self.collapsed_pids.contains(&leader.pid);
+                    let total_cpu = leader.cpu_usage + children.iter().map(|c| c.cpu_usage).sum::<f32>();
+                    let total_memory = leader.memory_bytes + children.iter().map(|c| c.memory_bytes).sum::<u64>();
+
+                    out.push(ProcessTreeRow {
+                        item: leader,
+                        depth: 0,
+                        has_children,
+                        is_collapsed,
+                        children_count,
+                        total_cpu,
+                        total_memory,
+                    });
+
+                    if has_children && !is_collapsed {
+                        for child in children {
+                            out.push(ProcessTreeRow {
+                                item: child,
+                                depth: 1,
+                                has_children: false,
+                                is_collapsed: false,
+                                children_count: 0,
+                                total_cpu: child.cpu_usage,
+                                total_memory: child.memory_bytes,
+                            });
+                        }
+                    }
+                } else {
+                    out.push(ProcessTreeRow {
+                        item: leader,
+                        depth: 0,
+                        has_children: false,
+                        is_collapsed: false,
+                        children_count: 0,
+                        total_cpu: leader.cpu_usage,
+                        total_memory: leader.memory_bytes,
+                    });
+                }
+            }
+
+            out
+        }
     }
 
     /// Get sorted and filtered slice of services
@@ -1468,5 +1548,73 @@ mod tests {
         state.toggle_service_sort(ServiceSortColumn::LoadState);
         let list = state.filtered_services();
         assert_eq!(list[0].load_state, "loaded"); // loaded < not-found
+    }
+
+    #[test]
+    fn test_tree_fallback_name_clustering() {
+        let mut state = ProcessState::default();
+        // All parent_pid = 0 (simulates older server without PPID)
+        state.processes = vec![
+            ntx_proto::ProcessItem {
+                pid: 10,
+                name: "python3".to_string(),
+                cpu_usage: 5.0,
+                memory_bytes: 100,
+                user: "user".to_string(),
+                status: "Run".to_string(),
+                command_line: "python3 worker1.py".to_string(),
+                parent_pid: 0,
+            },
+            ntx_proto::ProcessItem {
+                pid: 11,
+                name: "python3".to_string(),
+                cpu_usage: 10.0,
+                memory_bytes: 150,
+                user: "user".to_string(),
+                status: "Run".to_string(),
+                command_line: "python3 worker2.py".to_string(),
+                parent_pid: 0,
+            },
+            ntx_proto::ProcessItem {
+                pid: 20,
+                name: "standalone".to_string(),
+                cpu_usage: 1.0,
+                memory_bytes: 50,
+                user: "root".to_string(),
+                status: "Sleep".to_string(),
+                command_line: "standalone".to_string(),
+                parent_pid: 0,
+            },
+        ];
+
+        let rows = state.build_tree_rows();
+        assert_eq!(rows.len(), 3);
+        // python3 leader
+        assert_eq!(rows[0].item.pid, 11); // sorted by CPU default: 11 has 10.0, 10 has 5.0
+        assert_eq!(rows[0].has_children, true);
+        assert_eq!(rows[0].children_count, 1);
+        assert_eq!(rows[0].total_cpu, 15.0);
+        assert_eq!(rows[0].total_memory, 250);
+
+        // python3 child
+        assert_eq!(rows[1].item.pid, 10);
+        assert_eq!(rows[1].depth, 1);
+        assert_eq!(rows[1].has_children, false);
+
+        // standalone
+        assert_eq!(rows[2].item.pid, 20);
+        assert_eq!(rows[2].has_children, false);
+
+        // Collapse python3
+        state.toggle_collapse(rows[0].item.pid);
+        let rows_collapsed = state.build_tree_rows();
+        assert_eq!(rows_collapsed.len(), 2);
+        assert_eq!(rows_collapsed[0].is_collapsed, true);
+
+        // Test collapse_all
+        state.expand_all();
+        assert_eq!(state.build_tree_rows().len(), 3);
+        state.collapse_all();
+        assert_eq!(state.build_tree_rows().len(), 2);
     }
 }
