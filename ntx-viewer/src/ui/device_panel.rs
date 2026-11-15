@@ -1,19 +1,16 @@
 use crate::state::{ConnectionStatus, Device};
+use crate::ui::process_panel::{self, ProcessPanelAction};
 use crate::ui::terminal::{self, TerminalAction};
 use egui::{Color32, ProgressBar, RichText, Ui};
 use egui_plot::{Corner, Legend, Line, Plot, PlotPoints};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeviceTab {
+    #[default]
     Metrics,
+    Processes,
     Terminal,
     Config,
-}
-
-impl Default for DeviceTab {
-    fn default() -> Self {
-        DeviceTab::Metrics
-    }
 }
 
 pub struct DevicePanelState {
@@ -42,6 +39,7 @@ pub enum DevicePanelAction {
     SavePsk { id: String, psk: String },
     SwitchTab(DeviceTab),
     TerminalAction(TerminalAction),
+    ProcessAction(ProcessPanelAction),
 }
 
 pub fn render(
@@ -160,6 +158,15 @@ pub fn render(
             action = Some(DevicePanelAction::SwitchTab(DeviceTab::Metrics));
         }
 
+        let proc_btn = ui.selectable_label(
+            state.active_tab == DeviceTab::Processes,
+            "⚡ Processus & Services",
+        );
+        if proc_btn.clicked() {
+            state.active_tab = DeviceTab::Processes;
+            action = Some(DevicePanelAction::SwitchTab(DeviceTab::Processes));
+        }
+
         let terminal_btn = ui.selectable_label(
             state.active_tab == DeviceTab::Terminal,
             "💻 Terminal distant",
@@ -190,6 +197,15 @@ pub fn render(
     match state.active_tab {
         DeviceTab::Metrics => {
             render_metrics_tab(ui, device, &mut action);
+        }
+        DeviceTab::Processes => {
+            if let Some(act) = process_panel::render(
+                ui,
+                &mut device.process_state,
+                device.status.is_connected(),
+            ) {
+                action = Some(DevicePanelAction::ProcessAction(act));
+            }
         }
         DeviceTab::Terminal => {
             render_terminal_tab(ui, device, &mut action);

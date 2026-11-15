@@ -2,6 +2,7 @@ use crate::client::NtxClient;
 use crate::discovery::{start_discovery, DiscoveredDevice, DiscoveryEvent, DiscoveryHandle};
 use crate::state::{AppSettings, ConnectionStatus, Device, ManualDevice};
 use crate::ui::device_panel::{self, DevicePanelAction, DevicePanelState, DeviceTab};
+use crate::ui::process_panel::ProcessPanelAction;
 use crate::ui::settings::{self, SettingsAction, SettingsState};
 use crate::ui::sidebar::{self, SidebarAction, SidebarState};
 use crate::ui::terminal::TerminalAction;
@@ -43,6 +44,36 @@ pub enum AppEvent {
     },
     Disconnected {
         device_id: String,
+    },
+    ProcessesReceived {
+        device_id: String,
+        processes: Vec<ntx_proto::ProcessItem>,
+    },
+    ProcessesFailed {
+        device_id: String,
+        error: String,
+    },
+    ProcessKilled {
+        device_id: String,
+        pid: u32,
+        signal: i32,
+        success: bool,
+        error: String,
+    },
+    ServicesReceived {
+        device_id: String,
+        services: Vec<ntx_proto::ServiceItem>,
+    },
+    ServicesFailed {
+        device_id: String,
+        error: String,
+    },
+    ServiceControlled {
+        device_id: String,
+        service_name: String,
+        action: String,
+        success: bool,
+        error: String,
     },
 }
 
@@ -446,23 +477,288 @@ impl NtxApp {
             };
 
             while let Ok(Some(output)) = out_stream.message().await {
-                if !output.data.is_empty() {
-                    if event_tx
+                if !output.data.is_empty()
+                    && event_tx
                         .send(AppEvent::TerminalOutput {
                             device_id: dev_id.clone(),
                             data: output.data,
                         })
                         .await
                         .is_err()
-                    {
-                        break;
-                    }
+                {
+                    break;
                 }
             }
 
             let _ = event_tx
                 .send(AppEvent::TerminalClosed { device_id: dev_id })
                 .await;
+        });
+    }
+
+    fn get_client_credentials(&self, device_id: &str) -> Option<(String, String, String)> {
+        let dev = self.devices.get(device_id)?;
+        let endpoint = dev.grpc_endpoint();
+        let psk = self.get_effective_psk(dev);
+        let viewer_id = self.settings.viewer_id.clone();
+        Some((endpoint, psk, viewer_id))
+    }
+
+    fn fetch_processes(&mut self, device_id: &str) {
+        if let Some(dev) = self.devices.get_mut(device_id) {
+            if dev.process_state.is_loading_processes {
+                return;
+            }
+            dev.process_state.is_loading_processes = true;
+            dev.process_state.last_process_refresh = Some(std::time::Instant::now());
+        }
+
+        let (endpoint, psk, viewer_id) = match self.get_client_credentials(device_id) {
+            Some(c) => c,
+            None => return,
+        };
+
+        let dev_id = device_id.to_string();
+        let event_tx = self.event_tx.clone();
+
+        self.rt.spawn(async move {
+            let mut client = match NtxClient::connect(&endpoint).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = event_tx
+                        .send(AppEvent::ProcessesFailed {
+                            device_id: dev_id,
+                            error: format!("Failed to connect: {e}"),
+                        })
+                        .await;
+                    return;
+                }
+            };
+
+            if let Err(e) = client.authenticate(&psk, &viewer_id).await {
+                let _ = event_tx
+                    .send(AppEvent::ProcessesFailed {
+                        device_id: dev_id,
+                        error: format!("Authentication failed: {e}"),
+                    })
+                    .await;
+                return;
+            }
+
+            match client.list_processes().await {
+                Ok(processes) => {
+                    let _ = event_tx
+                        .send(AppEvent::ProcessesReceived {
+                            device_id: dev_id,
+                            processes,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = event_tx
+                        .send(AppEvent::ProcessesFailed {
+                            device_id: dev_id,
+                            error: format!("ListProcesses failed: {e}"),
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn fetch_services(&mut self, device_id: &str) {
+        if let Some(dev) = self.devices.get_mut(device_id) {
+            if dev.process_state.is_loading_services {
+                return;
+            }
+            dev.process_state.is_loading_services = true;
+            dev.process_state.last_service_refresh = Some(std::time::Instant::now());
+        }
+
+        let (endpoint, psk, viewer_id) = match self.get_client_credentials(device_id) {
+            Some(c) => c,
+            None => return,
+        };
+
+        let dev_id = device_id.to_string();
+        let event_tx = self.event_tx.clone();
+
+        self.rt.spawn(async move {
+            let mut client = match NtxClient::connect(&endpoint).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = event_tx
+                        .send(AppEvent::ServicesFailed {
+                            device_id: dev_id,
+                            error: format!("Failed to connect: {e}"),
+                        })
+                        .await;
+                    return;
+                }
+            };
+
+            if let Err(e) = client.authenticate(&psk, &viewer_id).await {
+                let _ = event_tx
+                    .send(AppEvent::ServicesFailed {
+                        device_id: dev_id,
+                        error: format!("Authentication failed: {e}"),
+                    })
+                    .await;
+                return;
+            }
+
+            match client.list_services().await {
+                Ok(services) => {
+                    let _ = event_tx
+                        .send(AppEvent::ServicesReceived {
+                            device_id: dev_id,
+                            services,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = event_tx
+                        .send(AppEvent::ServicesFailed {
+                            device_id: dev_id,
+                            error: format!("ListServices failed: {e}"),
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn kill_process(&mut self, device_id: &str, pid: u32, signal: i32) {
+        let (endpoint, psk, viewer_id) = match self.get_client_credentials(device_id) {
+            Some(c) => c,
+            None => return,
+        };
+
+        let dev_id = device_id.to_string();
+        let event_tx = self.event_tx.clone();
+
+        self.rt.spawn(async move {
+            let mut client = match NtxClient::connect(&endpoint).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = event_tx
+                        .send(AppEvent::ProcessKilled {
+                            device_id: dev_id,
+                            pid,
+                            signal,
+                            success: false,
+                            error: format!("Failed to connect: {e}"),
+                        })
+                        .await;
+                    return;
+                }
+            };
+
+            if let Err(e) = client.authenticate(&psk, &viewer_id).await {
+                let _ = event_tx
+                    .send(AppEvent::ProcessKilled {
+                        device_id: dev_id,
+                        pid,
+                        signal,
+                        success: false,
+                        error: format!("Authentication failed: {e}"),
+                    })
+                    .await;
+                return;
+            }
+
+            match client.kill_process(pid, signal).await {
+                Ok(resp) => {
+                    let _ = event_tx
+                        .send(AppEvent::ProcessKilled {
+                            device_id: dev_id,
+                            pid,
+                            signal,
+                            success: resp.success,
+                            error: resp.error_message,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = event_tx
+                        .send(AppEvent::ProcessKilled {
+                            device_id: dev_id,
+                            pid,
+                            signal,
+                            success: false,
+                            error: format!("KillProcess failed: {e}"),
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn control_service(&mut self, device_id: &str, service_name: &str, action: &str) {
+        let (endpoint, psk, viewer_id) = match self.get_client_credentials(device_id) {
+            Some(c) => c,
+            None => return,
+        };
+
+        let dev_id = device_id.to_string();
+        let s_name = service_name.to_string();
+        let act = action.to_string();
+        let event_tx = self.event_tx.clone();
+
+        self.rt.spawn(async move {
+            let mut client = match NtxClient::connect(&endpoint).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = event_tx
+                        .send(AppEvent::ServiceControlled {
+                            device_id: dev_id,
+                            service_name: s_name,
+                            action: act,
+                            success: false,
+                            error: format!("Failed to connect: {e}"),
+                        })
+                        .await;
+                    return;
+                }
+            };
+
+            if let Err(e) = client.authenticate(&psk, &viewer_id).await {
+                let _ = event_tx
+                    .send(AppEvent::ServiceControlled {
+                        device_id: dev_id,
+                        service_name: s_name,
+                        action: act,
+                        success: false,
+                        error: format!("Authentication failed: {e}"),
+                    })
+                    .await;
+                return;
+            }
+
+            match client.control_service(&s_name, &act).await {
+                Ok(resp) => {
+                    let _ = event_tx
+                        .send(AppEvent::ServiceControlled {
+                            device_id: dev_id,
+                            service_name: s_name,
+                            action: act,
+                            success: resp.success,
+                            error: resp.error_message,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = event_tx
+                        .send(AppEvent::ServiceControlled {
+                            device_id: dev_id,
+                            service_name: s_name,
+                            action: act,
+                            success: false,
+                            error: format!("ControlService failed: {e}"),
+                        })
+                        .await;
+                }
+            }
         });
     }
 
@@ -545,6 +841,10 @@ impl NtxApp {
                             let _ = self.settings.save();
                         }
                     }
+                    if self.device_panel_state.active_tab == DeviceTab::Processes {
+                        self.fetch_processes(&device_id);
+                        self.fetch_services(&device_id);
+                    }
                 }
                 AppEvent::ConnectionFailed {
                     device_id,
@@ -583,6 +883,89 @@ impl NtxApp {
                         }
                     }
                 }
+                AppEvent::ProcessesReceived {
+                    device_id,
+                    processes,
+                } => {
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        dev.process_state.processes = processes;
+                        dev.process_state.is_loading_processes = false;
+                    }
+                }
+                AppEvent::ProcessesFailed { device_id, error } => {
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        dev.process_state.is_loading_processes = false;
+                        dev.process_state.set_status(
+                            format!("Erreur lors de la récupération des processus: {error}"),
+                            true,
+                        );
+                    }
+                }
+                AppEvent::ProcessKilled {
+                    device_id,
+                    pid,
+                    signal,
+                    success,
+                    error,
+                } => {
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        if success {
+                            let sig_name = if signal == 9 { "SIGKILL" } else { "SIGTERM" };
+                            dev.process_state.set_status(
+                                format!(
+                                    "Signal {sig_name} envoyé au processus PID {pid} avec succès."
+                                ),
+                                false,
+                            );
+                        } else {
+                            dev.process_state.set_status(
+                                format!("Échec de l'arrêt du processus PID {pid}: {error}"),
+                                true,
+                            );
+                        }
+                    }
+                    self.fetch_processes(&device_id);
+                }
+                AppEvent::ServicesReceived {
+                    device_id,
+                    services,
+                } => {
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        dev.process_state.services = services;
+                        dev.process_state.is_loading_services = false;
+                    }
+                }
+                AppEvent::ServicesFailed { device_id, error } => {
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        dev.process_state.is_loading_services = false;
+                        dev.process_state.set_status(
+                            format!("Erreur lors de la récupération des services: {error}"),
+                            true,
+                        );
+                    }
+                }
+                AppEvent::ServiceControlled {
+                    device_id,
+                    service_name,
+                    action,
+                    success,
+                    error,
+                } => {
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        if success {
+                            dev.process_state.set_status(
+                                format!("Action '{action}' appliquée avec succès sur {service_name}."),
+                                false,
+                            );
+                        } else {
+                            dev.process_state.set_status(
+                                format!("Échec de l'action '{action}' sur {service_name}: {error}"),
+                                true,
+                            );
+                        }
+                    }
+                    self.fetch_services(&device_id);
+                }
             }
         }
     }
@@ -591,6 +974,33 @@ impl NtxApp {
 impl eframe::App for NtxApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_channels();
+
+        // Auto-refresh processes if enabled
+        if let Some(ref id) = self.selected_device_id {
+            if self.device_panel_state.active_tab == DeviceTab::Processes {
+                if let Some(dev) = self.devices.get(id) {
+                    if dev.status.is_connected()
+                        && dev.process_state.auto_refresh
+                        && !dev.process_state.is_loading_processes
+                    {
+                        let should_refresh = dev
+                            .process_state
+                            .last_process_refresh
+                            .map(|t| {
+                                t.elapsed()
+                                    >= Duration::from_secs(
+                                        dev.process_state.auto_refresh_interval_secs,
+                                    )
+                            })
+                            .unwrap_or(true);
+                        if should_refresh {
+                            let id_clone = id.clone();
+                            self.fetch_processes(&id_clone);
+                        }
+                    }
+                }
+            }
+        }
 
         // Repaint periodically for live charts and terminal
         ctx.request_repaint_after(Duration::from_millis(100));
@@ -692,68 +1102,108 @@ impl eframe::App for NtxApp {
                         self.open_terminal_session(&id);
                     }
 
-                    if let Some(dev) = self.devices.get_mut(&id) {
-                        if let Some(action) =
-                            device_panel::render(ui, &mut self.device_panel_state, dev)
-                        {
-                            match action {
-                                DevicePanelAction::Connect { id: dev_id, psk } => {
-                                    self.initiate_connect(&dev_id, psk);
+                    let action = if let Some(dev) = self.devices.get_mut(&id) {
+                        device_panel::render(ui, &mut self.device_panel_state, dev)
+                    } else {
+                        self.selected_device_id = self.devices.keys().next().cloned();
+                        None
+                    };
+
+                    if let Some(action) = action {
+                        match action {
+                            DevicePanelAction::Connect { id: dev_id, psk } => {
+                                self.initiate_connect(&dev_id, psk);
+                            }
+                            DevicePanelAction::Disconnect(dev_id) => {
+                                self.disconnect_device(&dev_id);
+                            }
+                            DevicePanelAction::Reconnect(dev_id) => {
+                                self.disconnect_device(&dev_id);
+                                self.initiate_connect(&dev_id, None);
+                            }
+                            DevicePanelAction::Remove(dev_id) => {
+                                self.disconnect_device(&dev_id);
+                                self.devices.remove(&dev_id);
+                                self.settings.device_psks.remove(&dev_id);
+                                self.settings
+                                    .manual_devices
+                                    .retain(|m| format!("{}:{}", m.address, m.port) != dev_id);
+                                self.save_known_devices();
+                                self.selected_device_id = self.devices.keys().next().cloned();
+                            }
+                            DevicePanelAction::SavePsk { id: dev_id, psk } => {
+                                if let Some(d) = self.devices.get_mut(&dev_id) {
+                                    d.psk = Some(psk.clone());
                                 }
-                                DevicePanelAction::Disconnect(dev_id) => {
-                                    self.disconnect_device(&dev_id);
-                                }
-                                DevicePanelAction::Reconnect(dev_id) => {
-                                    self.disconnect_device(&dev_id);
-                                    self.initiate_connect(&dev_id, None);
-                                }
-                                DevicePanelAction::Remove(dev_id) => {
-                                    self.disconnect_device(&dev_id);
-                                    self.devices.remove(&dev_id);
-                                    self.settings.device_psks.remove(&dev_id);
-                                    self.settings
-                                        .manual_devices
-                                        .retain(|m| format!("{}:{}", m.address, m.port) != dev_id);
-                                    self.save_known_devices();
-                                    self.selected_device_id = self.devices.keys().next().cloned();
-                                }
-                                DevicePanelAction::SavePsk { id: dev_id, psk } => {
-                                    if let Some(d) = self.devices.get_mut(&dev_id) {
-                                        d.psk = Some(psk.clone());
-                                    }
-                                    self.settings.device_psks.insert(dev_id, psk);
-                                    self.save_known_devices();
-                                }
-                                DevicePanelAction::SwitchTab(tab) => {
-                                    if tab == DeviceTab::Terminal
-                                        && dev.status.is_connected()
-                                        && !self.terminal_txs.contains_key(&id)
-                                    {
-                                        // Terminal will be auto-opened on next frame
-                                    }
-                                }
-                                DevicePanelAction::TerminalAction(term_action) => {
-                                    match term_action {
-                                        TerminalAction::SendData(data) => {
-                                            if let Some(tx) = self.terminal_txs.get(&id) {
-                                                let _ = tx.try_send(TerminalInput {
-                                                    input: Some(Input::Data(data)),
-                                                });
-                                            }
+                                self.settings.device_psks.insert(dev_id, psk);
+                                self.save_known_devices();
+                            }
+                            DevicePanelAction::SwitchTab(tab) => {
+                                if tab == DeviceTab::Processes {
+                                    let (need_proc, need_srv) = if let Some(d) = self.devices.get(&id) {
+                                        if d.status.is_connected() {
+                                            (
+                                                d.process_state.processes.is_empty()
+                                                    && !d.process_state.is_loading_processes,
+                                                d.process_state.services.is_empty()
+                                                    && !d.process_state.is_loading_services,
+                                            )
+                                        } else {
+                                            (false, false)
                                         }
-                                        TerminalAction::Clear => {}
-                                        TerminalAction::Reconnect => {
-                                            self.terminal_txs.remove(&id);
-                                            dev.terminal.clear();
-                                            self.open_terminal_session(&id);
+                                    } else {
+                                        (false, false)
+                                    };
+                                    if need_proc {
+                                        self.fetch_processes(&id);
+                                    }
+                                    if need_srv {
+                                        self.fetch_services(&id);
+                                    }
+                                }
+                                if tab == DeviceTab::Terminal {
+                                    // Terminal will be auto-opened on next frame
+                                }
+                            }
+                            DevicePanelAction::ProcessAction(proc_action) => {
+                                match proc_action {
+                                    ProcessPanelAction::RefreshProcesses => {
+                                        self.fetch_processes(&id);
+                                    }
+                                    ProcessPanelAction::RefreshServices => {
+                                        self.fetch_services(&id);
+                                    }
+                                    ProcessPanelAction::KillProcess { pid, signal } => {
+                                        self.kill_process(&id, pid, signal);
+                                    }
+                                    ProcessPanelAction::ControlService {
+                                        service_name,
+                                        action,
+                                    } => {
+                                        self.control_service(&id, &service_name, &action);
+                                    }
+                                }
+                            }
+                            DevicePanelAction::TerminalAction(term_action) => {
+                                match term_action {
+                                    TerminalAction::SendData(data) => {
+                                        if let Some(tx) = self.terminal_txs.get(&id) {
+                                            let _ = tx.try_send(TerminalInput {
+                                                input: Some(Input::Data(data)),
+                                            });
                                         }
+                                    }
+                                    TerminalAction::Clear => {}
+                                    TerminalAction::Reconnect => {
+                                        self.terminal_txs.remove(&id);
+                                        if let Some(d) = self.devices.get_mut(&id) {
+                                            d.terminal.clear();
+                                        }
+                                        self.open_terminal_session(&id);
                                     }
                                 }
                             }
                         }
-                    } else {
-                        // Selected ID no longer in list, fall back to first device or none
-                        self.selected_device_id = self.devices.keys().next().cloned();
                     }
                 } else {
                     // Empty state when no device exists or none is selected

@@ -3,11 +3,15 @@
 use crate::auth::AuthManager;
 use crate::config::{get_hostname, Config};
 use crate::monitoring::{self, collect_system_info};
+use crate::process;
+use crate::service_manager;
 use crate::terminal;
 use ntx_proto::ntx_agent_server::NtxAgent;
 use ntx_proto::{
-    AuthRequest, AuthResponse, Empty, MetricsRequest, PingResponse, SystemInfo, SystemMetrics,
-    TerminalInput, TerminalOutput,
+    AuthRequest, AuthResponse, ControlServiceRequest, ControlServiceResponse, Empty,
+    KillProcessRequest, KillProcessResponse, ListProcessesRequest, ListProcessesResponse,
+    ListServicesRequest, ListServicesResponse, MetricsRequest, PingResponse, SystemInfo,
+    SystemMetrics, TerminalInput, TerminalOutput,
 };
 use std::time::Instant;
 use sysinfo::{Disks, Networks, System};
@@ -121,6 +125,57 @@ impl NtxAgent for NtxAgentService {
             hostname,
             uptime_seconds,
             version,
+        }))
+    }
+
+    async fn list_processes(
+        &self,
+        request: Request<ListProcessesRequest>,
+    ) -> Result<Response<ListProcessesResponse>, Status> {
+        self.auth.verify_request(&request)?;
+        let processes = process::list_processes().await;
+        Ok(Response::new(ListProcessesResponse { processes }))
+    }
+
+    async fn kill_process(
+        &self,
+        request: Request<KillProcessRequest>,
+    ) -> Result<Response<KillProcessResponse>, Status> {
+        self.auth.verify_request(&request)?;
+        let req = request.into_inner();
+        let (success, error_message) = match process::kill_process(req.pid, req.signal) {
+            Ok(()) => (true, String::new()),
+            Err(e) => (false, e),
+        };
+        Ok(Response::new(KillProcessResponse {
+            success,
+            error_message,
+        }))
+    }
+
+    async fn list_services(
+        &self,
+        request: Request<ListServicesRequest>,
+    ) -> Result<Response<ListServicesResponse>, Status> {
+        self.auth.verify_request(&request)?;
+        let services = service_manager::list_system_services();
+        Ok(Response::new(ListServicesResponse { services }))
+    }
+
+    async fn control_service(
+        &self,
+        request: Request<ControlServiceRequest>,
+    ) -> Result<Response<ControlServiceResponse>, Status> {
+        self.auth.verify_request(&request)?;
+        let req = request.into_inner();
+        let (success, error_message) =
+            match service_manager::control_system_service(&req.service_name, &req.action) {
+                Ok(()) => (true, String::new()),
+                Err(e) => (false, e),
+            };
+        Ok(Response::new(ControlServiceResponse {
+            success,
+            error_message,
         }))
     }
 }
@@ -244,5 +299,139 @@ mod tests {
 
         assert!(first_metric.total_memory_bytes > 0);
         assert!(first_metric.timestamp_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_processes_auth() {
+        let psk = "test_key_proc";
+        let mut config = Config::default();
+        config.server.psk = psk.to_string();
+
+        let auth = AuthManager::new(psk);
+        let service = NtxAgentService::new(config, auth);
+
+        // 1. Unauthenticated -> fails
+        let unauth_req = Request::new(ListProcessesRequest {});
+        assert!(service.list_processes(unauth_req).await.is_err());
+
+        // 2. Authenticated -> succeeds
+        let mut req = Request::new(ListProcessesRequest {});
+        let psk_hash = hash_psk(psk);
+        req.metadata_mut().insert(
+            crate::auth::AUTH_HEADER,
+            MetadataValue::from_str(&psk_hash).unwrap(),
+        );
+
+        let resp = service.list_processes(req).await.unwrap().into_inner();
+        assert!(!resp.processes.is_empty());
+        let current_pid = std::process::id();
+        assert!(resp.processes.iter().any(|p| p.pid == current_pid));
+    }
+
+    #[tokio::test]
+    async fn test_kill_process_auth() {
+        let psk = "test_key_kill";
+        let mut config = Config::default();
+        config.server.psk = psk.to_string();
+
+        let auth = AuthManager::new(psk);
+        let service = NtxAgentService::new(config, auth);
+
+        // 1. Unauthenticated -> fails
+        let unauth_req = Request::new(KillProcessRequest {
+            pid: 99999999,
+            signal: 15,
+        });
+        assert!(service.kill_process(unauth_req).await.is_err());
+
+        // 2. Authenticated -> returns response (pid not found -> success: false)
+        let mut req = Request::new(KillProcessRequest {
+            pid: 99999999,
+            signal: 15,
+        });
+        let psk_hash = hash_psk(psk);
+        req.metadata_mut().insert(
+            crate::auth::AUTH_HEADER,
+            MetadataValue::from_str(&psk_hash).unwrap(),
+        );
+
+        let resp = service.kill_process(req).await.unwrap().into_inner();
+        assert!(!resp.success);
+        assert!(!resp.error_message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_services_auth() {
+        let psk = "test_key_svc";
+        let mut config = Config::default();
+        config.server.psk = psk.to_string();
+
+        let auth = AuthManager::new(psk);
+        let service = NtxAgentService::new(config, auth);
+
+        // 1. Unauthenticated -> fails
+        let unauth_req = Request::new(ListServicesRequest {});
+        assert!(service.list_services(unauth_req).await.is_err());
+
+        // 2. Authenticated -> succeeds
+        let mut req = Request::new(ListServicesRequest {});
+        let psk_hash = hash_psk(psk);
+        req.metadata_mut().insert(
+            crate::auth::AUTH_HEADER,
+            MetadataValue::from_str(&psk_hash).unwrap(),
+        );
+
+        let resp = service.list_services(req).await.unwrap().into_inner();
+        assert!(!resp.services.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_control_service_auth() {
+        let psk = "test_key_ctrl";
+        let mut config = Config::default();
+        config.server.psk = psk.to_string();
+
+        let auth = AuthManager::new(psk);
+        let service = NtxAgentService::new(config, auth);
+
+        // 1. Unauthenticated -> fails
+        let unauth_req = Request::new(ControlServiceRequest {
+            service_name: "mock-service".to_string(),
+            action: "start".to_string(),
+        });
+        assert!(service.control_service(unauth_req).await.is_err());
+
+        // 2. Authenticated with valid mock service -> succeeds
+        let mut req = Request::new(ControlServiceRequest {
+            service_name: "mock-service".to_string(),
+            action: "start".to_string(),
+        });
+        let psk_hash = hash_psk(psk);
+        req.metadata_mut().insert(
+            crate::auth::AUTH_HEADER,
+            MetadataValue::from_str(&psk_hash).unwrap(),
+        );
+
+        let resp = service.control_service(req).await.unwrap().into_inner();
+        assert!(resp.success);
+        assert!(resp.error_message.is_empty());
+
+        // 3. Authenticated with invalid action -> returns failure
+        let mut req_invalid = Request::new(ControlServiceRequest {
+            service_name: "mock-service".to_string(),
+            action: "invalid_action".to_string(),
+        });
+        req_invalid.metadata_mut().insert(
+            crate::auth::AUTH_HEADER,
+            MetadataValue::from_str(&psk_hash).unwrap(),
+        );
+
+        let resp_invalid = service
+            .control_service(req_invalid)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp_invalid.success);
+        assert!(!resp_invalid.error_message.is_empty());
     }
 }

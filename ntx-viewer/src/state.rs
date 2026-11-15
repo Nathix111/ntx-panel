@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
+use std::time::Instant;
 
 /// Connection status of a discovered or added device.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,6 +277,219 @@ impl TerminalBuffer {
     }
 }
 
+/// Column used for sorting the process table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessSortColumn {
+    Pid,
+    Name,
+    User,
+    Cpu,
+    Memory,
+    Status,
+    CommandLine,
+}
+
+/// Column used for sorting the system services table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceSortColumn {
+    Name,
+    Description,
+    ActiveState,
+    SubState,
+    LoadState,
+}
+
+/// Sorting direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+/// Subtab within the Process & Services manager view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProcessSubTab {
+    #[default]
+    Processes,
+    Services,
+}
+
+/// State for caching processes, services, filter search queries, and sort parameters.
+#[derive(Debug, Clone)]
+pub struct ProcessState {
+    pub processes: Vec<ntx_proto::ProcessItem>,
+    pub services: Vec<ntx_proto::ServiceItem>,
+    pub process_filter: String,
+    pub service_filter: String,
+    pub process_sort_column: ProcessSortColumn,
+    pub process_sort_direction: SortDirection,
+    pub service_sort_column: ServiceSortColumn,
+    pub service_sort_direction: SortDirection,
+    pub auto_refresh: bool,
+    pub auto_refresh_interval_secs: u64,
+    pub last_process_refresh: Option<Instant>,
+    pub last_service_refresh: Option<Instant>,
+    pub is_loading_processes: bool,
+    pub is_loading_services: bool,
+    pub active_subtab: ProcessSubTab,
+    pub status_message: Option<(String, bool)>, // (message, is_error)
+}
+
+impl Default for ProcessState {
+    fn default() -> Self {
+        Self {
+            processes: Vec::new(),
+            services: Vec::new(),
+            process_filter: String::new(),
+            service_filter: String::new(),
+            process_sort_column: ProcessSortColumn::Cpu,
+            process_sort_direction: SortDirection::Descending,
+            service_sort_column: ServiceSortColumn::Name,
+            service_sort_direction: SortDirection::Ascending,
+            auto_refresh: false,
+            auto_refresh_interval_secs: 3,
+            last_process_refresh: None,
+            last_service_refresh: None,
+            is_loading_processes: false,
+            is_loading_services: false,
+            active_subtab: ProcessSubTab::Processes,
+            status_message: None,
+        }
+    }
+}
+
+impl ProcessState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set a temporary notification or error message
+    pub fn set_status(&mut self, msg: impl Into<String>, is_error: bool) {
+        self.status_message = Some((msg.into(), is_error));
+    }
+
+    pub fn clear_status(&mut self) {
+        self.status_message = None;
+    }
+
+    /// Toggle or change sorting for processes
+    pub fn toggle_process_sort(&mut self, col: ProcessSortColumn) {
+        if self.process_sort_column == col {
+            self.process_sort_direction = match self.process_sort_direction {
+                SortDirection::Ascending => SortDirection::Descending,
+                SortDirection::Descending => SortDirection::Ascending,
+            };
+        } else {
+            self.process_sort_column = col;
+            self.process_sort_direction = match col {
+                ProcessSortColumn::Cpu | ProcessSortColumn::Memory => SortDirection::Descending,
+                _ => SortDirection::Ascending,
+            };
+        }
+    }
+
+    /// Toggle or change sorting for services
+    pub fn toggle_service_sort(&mut self, col: ServiceSortColumn) {
+        if self.service_sort_column == col {
+            self.service_sort_direction = match self.service_sort_direction {
+                SortDirection::Ascending => SortDirection::Descending,
+                SortDirection::Descending => SortDirection::Ascending,
+            };
+        } else {
+            self.service_sort_column = col;
+            self.service_sort_direction = SortDirection::Ascending;
+        }
+    }
+
+    /// Get sorted and filtered slice of processes
+    pub fn filtered_processes(&self) -> Vec<&ntx_proto::ProcessItem> {
+        let q = self.process_filter.trim().to_lowercase();
+        let mut list: Vec<&ntx_proto::ProcessItem> = self
+            .processes
+            .iter()
+            .filter(|p| {
+                if q.is_empty() {
+                    return true;
+                }
+                p.name.to_lowercase().contains(&q)
+                    || p.pid.to_string().contains(&q)
+                    || p.user.to_lowercase().contains(&q)
+                    || p.status.to_lowercase().contains(&q)
+                    || p.command_line.to_lowercase().contains(&q)
+            })
+            .collect();
+
+        list.sort_by(|a, b| {
+            let cmp = match self.process_sort_column {
+                ProcessSortColumn::Pid => a.pid.cmp(&b.pid),
+                ProcessSortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                ProcessSortColumn::User => a.user.to_lowercase().cmp(&b.user.to_lowercase()),
+                ProcessSortColumn::Cpu => a
+                    .cpu_usage
+                    .partial_cmp(&b.cpu_usage)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                ProcessSortColumn::Memory => a.memory_bytes.cmp(&b.memory_bytes),
+                ProcessSortColumn::Status => {
+                    a.status.to_lowercase().cmp(&b.status.to_lowercase())
+                }
+                ProcessSortColumn::CommandLine => a
+                    .command_line
+                    .to_lowercase()
+                    .cmp(&b.command_line.to_lowercase()),
+            };
+            match self.process_sort_direction {
+                SortDirection::Ascending => cmp,
+                SortDirection::Descending => cmp.reverse(),
+            }
+        });
+
+        list
+    }
+
+    /// Get sorted and filtered slice of services
+    pub fn filtered_services(&self) -> Vec<&ntx_proto::ServiceItem> {
+        let q = self.service_filter.trim().to_lowercase();
+        let mut list: Vec<&ntx_proto::ServiceItem> = self
+            .services
+            .iter()
+            .filter(|s| {
+                if q.is_empty() {
+                    return true;
+                }
+                s.name.to_lowercase().contains(&q)
+                    || s.description.to_lowercase().contains(&q)
+                    || s.active_state.to_lowercase().contains(&q)
+                    || s.sub_state.to_lowercase().contains(&q)
+                    || s.load_state.to_lowercase().contains(&q)
+            })
+            .collect();
+
+        list.sort_by(|a, b| {
+            let cmp = match self.service_sort_column {
+                ServiceSortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                ServiceSortColumn::Description => {
+                    a.description.to_lowercase().cmp(&b.description.to_lowercase())
+                }
+                ServiceSortColumn::ActiveState => {
+                    a.active_state.to_lowercase().cmp(&b.active_state.to_lowercase())
+                }
+                ServiceSortColumn::SubState => {
+                    a.sub_state.to_lowercase().cmp(&b.sub_state.to_lowercase())
+                }
+                ServiceSortColumn::LoadState => {
+                    a.load_state.to_lowercase().cmp(&b.load_state.to_lowercase())
+                }
+            };
+            match self.service_sort_direction {
+                SortDirection::Ascending => cmp,
+                SortDirection::Descending => cmp.reverse(),
+            }
+        });
+
+        list
+    }
+}
+
 /// A remote machine managed by NTX Panel.
 #[derive(Debug, Clone)]
 pub struct Device {
@@ -296,6 +510,8 @@ pub struct Device {
     pub tx_history: VecDeque<f64>,
     // Remote terminal
     pub terminal: TerminalBuffer,
+    // Process & service manager
+    pub process_state: ProcessState,
 }
 
 impl Device {
@@ -322,6 +538,7 @@ impl Device {
             rx_history: VecDeque::with_capacity(120),
             tx_history: VecDeque::with_capacity(120),
             terminal: TerminalBuffer::new(),
+            process_state: ProcessState::default(),
         }
     }
 
@@ -578,5 +795,195 @@ mod tests {
         term.clear();
         assert_eq!(term.lines.len(), 0);
         assert!(term.current_spans.is_empty());
+    }
+
+    #[test]
+    fn test_process_state_filtering_and_sorting() {
+        let mut state = ProcessState::default();
+        state.processes = vec![
+            ntx_proto::ProcessItem {
+                pid: 100,
+                name: "systemd".to_string(),
+                cpu_usage: 0.5,
+                memory_bytes: 10 * 1024 * 1024,
+                user: "root".to_string(),
+                status: "running".to_string(),
+                command_line: "/sbin/init".to_string(),
+            },
+            ntx_proto::ProcessItem {
+                pid: 200,
+                name: "chrome".to_string(),
+                cpu_usage: 15.2,
+                memory_bytes: 500 * 1024 * 1024,
+                user: "user".to_string(),
+                status: "sleeping".to_string(),
+                command_line: "/opt/google/chrome".to_string(),
+            },
+            ntx_proto::ProcessItem {
+                pid: 300,
+                name: "ntx-server".to_string(),
+                cpu_usage: 2.1,
+                memory_bytes: 25 * 1024 * 1024,
+                user: "root".to_string(),
+                status: "running".to_string(),
+                command_line: "./ntx-server".to_string(),
+            },
+        ];
+
+        // Default sort is CPU descending
+        let sorted = state.filtered_processes();
+        assert_eq!(sorted.len(), 3);
+        assert_eq!(sorted[0].name, "chrome");
+        assert_eq!(sorted[1].name, "ntx-server");
+        assert_eq!(sorted[2].name, "systemd");
+
+        // Filter by "ntx"
+        state.process_filter = "ntx".to_string();
+        let filtered = state.filtered_processes();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].pid, 300);
+
+        // Clear filter and sort by PID ascending
+        state.process_filter.clear();
+        state.toggle_process_sort(ProcessSortColumn::Pid);
+        assert_eq!(state.process_sort_column, ProcessSortColumn::Pid);
+        assert_eq!(state.process_sort_direction, SortDirection::Ascending);
+        let sorted_pid = state.filtered_processes();
+        assert_eq!(sorted_pid[0].pid, 100);
+        assert_eq!(sorted_pid[2].pid, 300);
+
+        // Toggle sort on PID flips to descending
+        state.toggle_process_sort(ProcessSortColumn::Pid);
+        assert_eq!(state.process_sort_direction, SortDirection::Descending);
+        let sorted_pid_desc = state.filtered_processes();
+        assert_eq!(sorted_pid_desc[0].pid, 300);
+        assert_eq!(sorted_pid_desc[2].pid, 100);
+    }
+
+    #[test]
+    fn test_service_state_filtering_and_sorting() {
+        let mut state = ProcessState::default();
+        state.services = vec![
+            ntx_proto::ServiceItem {
+                name: "nginx.service".to_string(),
+                description: "Nginx Web Server".to_string(),
+                load_state: "loaded".to_string(),
+                active_state: "active".to_string(),
+                sub_state: "running".to_string(),
+            },
+            ntx_proto::ServiceItem {
+                name: "apache2.service".to_string(),
+                description: "Apache Web Server".to_string(),
+                load_state: "loaded".to_string(),
+                active_state: "inactive".to_string(),
+                sub_state: "dead".to_string(),
+            },
+        ];
+
+        // Default sort is Name ascending
+        let list = state.filtered_services();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].name, "apache2.service");
+        assert_eq!(list[1].name, "nginx.service");
+
+        // Filter by "nginx"
+        state.service_filter = "nginx".to_string();
+        let filtered = state.filtered_services();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "nginx.service");
+    }
+
+    #[test]
+    fn test_process_state_all_sort_columns_and_status() {
+        let mut state = ProcessState::default();
+        state.set_status("Operation succeeded", false);
+        assert_eq!(
+            state.status_message,
+            Some(("Operation succeeded".to_string(), false))
+        );
+        state.clear_status();
+        assert_eq!(state.status_message, None);
+
+        state.processes = vec![
+            ntx_proto::ProcessItem {
+                pid: 1,
+                name: "b_proc".to_string(),
+                cpu_usage: 10.0,
+                memory_bytes: 200,
+                user: "alice".to_string(),
+                status: "Running".to_string(),
+                command_line: "b_proc --arg1".to_string(),
+            },
+            ntx_proto::ProcessItem {
+                pid: 2,
+                name: "a_proc".to_string(),
+                cpu_usage: 20.0,
+                memory_bytes: 100,
+                user: "bob".to_string(),
+                status: "Sleeping".to_string(),
+                command_line: "a_proc --arg2".to_string(),
+            },
+        ];
+
+        // Sort by Memory (default descending)
+        state.toggle_process_sort(ProcessSortColumn::Memory);
+        let list = state.filtered_processes();
+        assert_eq!(list[0].pid, 1); // 200 > 100
+
+        // Sort by User
+        state.toggle_process_sort(ProcessSortColumn::User);
+        let list = state.filtered_processes();
+        assert_eq!(list[0].user, "alice");
+
+        // Sort by Status
+        state.toggle_process_sort(ProcessSortColumn::Status);
+        let list = state.filtered_processes();
+        assert_eq!(list[0].status, "Running");
+
+        // Sort by CommandLine
+        state.toggle_process_sort(ProcessSortColumn::CommandLine);
+        let list = state.filtered_processes();
+        assert_eq!(list[0].name, "a_proc");
+    }
+
+    #[test]
+    fn test_service_state_all_sort_columns() {
+        let mut state = ProcessState::default();
+        state.services = vec![
+            ntx_proto::ServiceItem {
+                name: "srv_b".to_string(),
+                description: "Zeta Description".to_string(),
+                load_state: "loaded".to_string(),
+                active_state: "active".to_string(),
+                sub_state: "running".to_string(),
+            },
+            ntx_proto::ServiceItem {
+                name: "srv_a".to_string(),
+                description: "Alpha Description".to_string(),
+                load_state: "not-found".to_string(),
+                active_state: "inactive".to_string(),
+                sub_state: "dead".to_string(),
+            },
+        ];
+
+        // Sort by Description
+        state.toggle_service_sort(ServiceSortColumn::Description);
+        let list = state.filtered_services();
+        assert_eq!(list[0].name, "srv_a"); // Alpha < Zeta
+
+        // Sort by ActiveState
+        state.toggle_service_sort(ServiceSortColumn::ActiveState);
+        let list = state.filtered_services();
+        assert_eq!(list[0].active_state, "active"); // active < inactive
+
+        // Sort by SubState
+        state.toggle_service_sort(ServiceSortColumn::SubState);
+        let list = state.filtered_services();
+        assert_eq!(list[0].sub_state, "dead"); // dead < running
+
+        // Sort by LoadState
+        state.toggle_service_sort(ServiceSortColumn::LoadState);
+        let list = state.filtered_services();
+        assert_eq!(list[0].load_state, "loaded"); // loaded < not-found
     }
 }
