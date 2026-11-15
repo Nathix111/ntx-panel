@@ -1,10 +1,10 @@
 use crate::client::NtxClient;
 use crate::discovery::{start_discovery, DiscoveredDevice, DiscoveryEvent, DiscoveryHandle};
 use crate::state::{AppSettings, ConnectionStatus, Device, ManualDevice};
-use crate::ui::dashboard::{self, DashboardAction, DashboardState};
-use crate::ui::device_panel::{self, DevicePanelAction};
+use crate::ui::device_panel::{self, DevicePanelAction, DevicePanelState, DeviceTab};
 use crate::ui::settings::{self, SettingsAction, SettingsState};
-use crate::ui::terminal::{self, TerminalAction};
+use crate::ui::sidebar::{self, SidebarAction, SidebarState};
+use crate::ui::terminal::TerminalAction;
 use ntx_proto::terminal_input::Input;
 use ntx_proto::{SystemInfo, SystemMetrics, TerminalInput, TerminalResize};
 use std::collections::HashMap;
@@ -14,11 +14,9 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum View {
-    Dashboard,
-    DeviceDetail(String),
-    Terminal(String),
-    Settings,
+pub enum ActiveView {
+    Device,
+    GlobalSettings,
 }
 
 pub enum AppEvent {
@@ -50,10 +48,12 @@ pub enum AppEvent {
 
 pub struct NtxApp {
     rt: Arc<tokio::runtime::Runtime>,
-    current_view: View,
+    active_view: ActiveView,
+    selected_device_id: Option<String>,
+    device_panel_state: DevicePanelState,
+    sidebar_state: SidebarState,
     devices: HashMap<String, Device>,
     settings: AppSettings,
-    dashboard_state: DashboardState,
     settings_state: SettingsState,
     discovery_handle: Option<DiscoveryHandle>,
     discovery_rx: mpsc::Receiver<DiscoveryEvent>,
@@ -80,10 +80,12 @@ impl NtxApp {
 
         let mut app = Self {
             rt,
-            current_view: View::Dashboard,
+            active_view: ActiveView::Device,
+            selected_device_id: None,
+            device_panel_state: DevicePanelState::default(),
+            sidebar_state: SidebarState::new(),
             devices: HashMap::new(),
             settings,
-            dashboard_state: DashboardState::new(),
             settings_state: SettingsState::default(),
             discovery_handle,
             discovery_rx: disc_rx,
@@ -113,6 +115,17 @@ impl NtxApp {
         // 2. Load any saved manual devices from settings
         for manual in &app.settings.manual_devices.clone() {
             app.add_manual_device(manual.clone());
+        }
+
+        // 3. Auto-select first device if available
+        if !app.devices.is_empty() {
+            let first_id = app.devices.keys().next().cloned();
+            if let Some(ref id) = first_id {
+                if let Some(dev) = app.devices.get(id) {
+                    app.device_panel_state.psk_input = dev.psk.clone().unwrap_or_default();
+                }
+            }
+            app.selected_device_id = first_id;
         }
 
         app
@@ -153,6 +166,9 @@ impl NtxApp {
                     dev.psk = manual.psk;
                 }
             }
+            if self.selected_device_id.is_none() {
+                self.selected_device_id = Some(id);
+            }
         } else {
             let id = format!("{}:{}", manual.address, manual.port);
             let mut dev = Device::new(
@@ -163,7 +179,10 @@ impl NtxApp {
                 "manual".to_string(),
             );
             dev.psk = manual.psk;
-            self.devices.insert(id, dev);
+            self.devices.insert(id.clone(), dev);
+            if self.selected_device_id.is_none() {
+                self.selected_device_id = Some(id);
+            }
         }
         self.save_known_devices();
     }
@@ -248,7 +267,9 @@ impl NtxApp {
         let dev_id = device_id.to_string();
 
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
-        self.metrics_cancel_txs.insert(dev_id.clone(), cancel_tx);
+        if let Some(old_tx) = self.metrics_cancel_txs.insert(dev_id.clone(), cancel_tx) {
+            let _ = old_tx.send(());
+        }
 
         self.rt.spawn(async move {
             info!("Connecting to device {} at {}", dev_id, endpoint);
@@ -267,7 +288,6 @@ impl NtxApp {
                 }
             };
 
-            // Authenticate
             let session_token = match client.authenticate(&psk, &viewer_id).await {
                 Ok(token) => token,
                 Err(e) => {
@@ -286,7 +306,6 @@ impl NtxApp {
                 }
             };
 
-            // Get static system info
             let system_info = match client.get_system_info().await {
                 Ok(info) => info,
                 Err(e) => {
@@ -303,7 +322,6 @@ impl NtxApp {
                 })
                 .await;
 
-            // Stream metrics in a loop
             match client.stream_metrics(interval_ms).await {
                 Ok(mut stream) => loop {
                     tokio::select! {
@@ -351,6 +369,7 @@ impl NtxApp {
         self.terminal_txs.remove(device_id);
         if let Some(dev) = self.devices.get_mut(device_id) {
             dev.status = ConnectionStatus::Disconnected;
+            dev.session_token = None;
         }
     }
 
@@ -373,9 +392,11 @@ impl NtxApp {
         let (input_tx, input_rx) = mpsc::channel::<TerminalInput>(64);
         self.terminal_txs.insert(dev_id.clone(), input_tx.clone());
 
-        // Send initial resize
         let _ = input_tx.try_send(TerminalInput {
-            input: Some(Input::Resize(TerminalResize { cols: 80, rows: 24 })),
+            input: Some(Input::Resize(TerminalResize {
+                cols: 80,
+                rows: 24,
+            })),
         });
 
         self.rt.spawn(async move {
@@ -408,28 +429,34 @@ impl NtxApp {
                 return;
             }
 
-            match client.open_terminal(input_rx).await {
-                Ok(mut stream) => {
-                    while let Ok(Some(output)) = stream.message().await {
-                        if event_tx
-                            .send(AppEvent::TerminalOutput {
-                                device_id: dev_id.clone(),
-                                data: output.data,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
+            let mut out_stream = match client.open_terminal(input_rx).await {
+                Ok(s) => s,
                 Err(e) => {
                     let _ = event_tx
                         .send(AppEvent::TerminalOutput {
                             device_id: dev_id.clone(),
-                            data: format!("Terminal stream error: {e}\r\n").into_bytes(),
+                            data: format!("Failed to open terminal stream: {e}\r\n").into_bytes(),
                         })
                         .await;
+                    let _ = event_tx
+                        .send(AppEvent::TerminalClosed { device_id: dev_id })
+                        .await;
+                    return;
+                }
+            };
+
+            while let Ok(Some(output)) = out_stream.message().await {
+                if !output.data.is_empty() {
+                    if event_tx
+                        .send(AppEvent::TerminalOutput {
+                            device_id: dev_id.clone(),
+                            data: output.data,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             }
 
@@ -450,7 +477,6 @@ impl NtxApp {
                     port,
                     version,
                 }) => {
-                    // Check if an existing device matches by ID, or by IP+port, or by hostname+port
                     let existing_id = self.devices.iter().find_map(|(id, d)| {
                         if id == &fullname {
                             return Some(id.clone());
@@ -482,7 +508,10 @@ impl NtxApp {
                         if let Some(saved) = self.settings.device_psks.get(&id) {
                             dev.psk = Some(saved.clone());
                         }
-                        self.devices.insert(id, dev);
+                        self.devices.insert(id.clone(), dev);
+                        if self.selected_device_id.is_none() {
+                            self.selected_device_id = Some(id);
+                        }
                     }
                     self.save_known_devices();
                 }
@@ -566,100 +595,48 @@ impl eframe::App for NtxApp {
         // Repaint periodically for live charts and terminal
         ctx.request_repaint_after(Duration::from_millis(100));
 
-        // Top Navigation Bar
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("⚡ NTX Panel");
+        // 1. Left Sidebar: Connections & Servers list
+        egui::SidePanel::left("server_sidebar")
+            .resizable(true)
+            .default_width(260.0)
+            .min_width(200.0)
+            .max_width(380.0)
+            .show(ctx, |ui| {
+                let devices_vec: Vec<Device> = {
+                    let mut v: Vec<Device> = self.devices.values().cloned().collect();
+                    // Sort: connected first, then alphabetical by hostname
+                    v.sort_by(|a, b| {
+                        let a_conn = a.status.is_connected();
+                        let b_conn = b.status.is_connected();
+                        b_conn.cmp(&a_conn).then_with(|| {
+                            a.hostname.to_lowercase().cmp(&b.hostname.to_lowercase())
+                        })
+                    });
+                    v
+                };
 
-                ui.separator();
-
-                let mut to_dash = false;
-                let mut to_settings = false;
-
-                if ui
-                    .selectable_label(matches!(self.current_view, View::Dashboard), "📊 Dashboard")
-                    .clicked()
-                {
-                    to_dash = true;
-                }
-
-                if ui
-                    .selectable_label(matches!(self.current_view, View::Settings), "⚙ Settings")
-                    .clicked()
-                {
-                    to_settings = true;
-                }
-
-                if to_dash {
-                    self.current_view = View::Dashboard;
-                } else if to_settings {
-                    self.current_view = View::Settings;
-                }
-
-                // Active view breadcrumbs
-                match &self.current_view {
-                    View::DeviceDetail(id) => {
-                        ui.separator();
-                        let name = self
-                            .devices
-                            .get(id)
-                            .map(|d| d.hostname.as_str())
-                            .unwrap_or(id.as_str());
-                        ui.label(format!("Monitor: {}", name));
-                    }
-                    View::Terminal(id) => {
-                        ui.separator();
-                        let name = self
-                            .devices
-                            .get(id)
-                            .map(|d| d.hostname.as_str())
-                            .unwrap_or(id.as_str());
-                        ui.label(format!("Terminal: {}", name));
-                    }
-                    _ => {}
-                }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let connected_count = self
-                        .devices
-                        .values()
-                        .filter(|d| matches!(d.status, ConnectionStatus::Connected))
-                        .count();
-                    ui.label(format!(
-                        "Online: {}/{}",
-                        connected_count,
-                        self.devices.len()
-                    ));
-                });
-            });
-        });
-
-        // Main Content Panel
-        egui::CentralPanel::default().show(ctx, |ui| match &self.current_view {
-            View::Dashboard => {
-                let devices_vec: Vec<Device> = self.devices.values().cloned().collect();
-                if let Some(action) = dashboard::render(ui, &mut self.dashboard_state, &devices_vec)
-                {
+                if let Some(action) = sidebar::render(
+                    ui,
+                    &mut self.sidebar_state,
+                    &devices_vec,
+                    self.selected_device_id.as_deref(),
+                ) {
                     match action {
-                        DashboardAction::Connect { id, psk } => {
-                            self.initiate_connect(&id, psk);
+                        SidebarAction::SelectDevice(id) => {
+                            self.selected_device_id = Some(id.clone());
+                            self.active_view = ActiveView::Device;
+                            if let Some(dev) = self.devices.get(&id) {
+                                self.device_panel_state.psk_input =
+                                    dev.psk.clone().unwrap_or_default();
+                            }
                         }
-                        DashboardAction::Disconnect(id) => {
+                        SidebarAction::ConnectDevice(id) => {
+                            self.initiate_connect(&id, None);
+                        }
+                        SidebarAction::DisconnectDevice(id) => {
                             self.disconnect_device(&id);
                         }
-                        DashboardAction::OpenMonitor(id) => {
-                            self.current_view = View::DeviceDetail(id);
-                        }
-                        DashboardAction::OpenTerminal(id) => {
-                            self.open_terminal_session(&id);
-                            self.current_view = View::Terminal(id);
-                        }
-                        DashboardAction::AddManualDevice(manual) => {
-                            self.settings.manual_devices.push(manual.clone());
-                            let _ = self.settings.save();
-                            self.add_manual_device(manual);
-                        }
-                        DashboardAction::RemoveDevice(id) => {
+                        SidebarAction::RemoveDevice(id) => {
                             self.disconnect_device(&id);
                             self.devices.remove(&id);
                             self.settings.device_psks.remove(&id);
@@ -667,80 +644,144 @@ impl eframe::App for NtxApp {
                                 .manual_devices
                                 .retain(|m| format!("{}:{}", m.address, m.port) != id);
                             self.save_known_devices();
+                            if self.selected_device_id.as_deref() == Some(&id) {
+                                self.selected_device_id = self.devices.keys().next().cloned();
+                            }
                         }
-                        DashboardAction::RefreshDiscovery => {
+                        SidebarAction::AddManualDevice(manual) => {
+                            self.settings.manual_devices.push(manual.clone());
+                            let _ = self.settings.save();
+                            self.add_manual_device(manual);
+                        }
+                        SidebarAction::RefreshDiscovery => {
                             self.restart_discovery();
                         }
-                    }
-                }
-            }
-            View::DeviceDetail(id) => {
-                let dev_opt = self.devices.get(id).cloned();
-                if let Some(dev) = dev_opt {
-                    if let Some(action) = device_panel::render(ui, &dev) {
-                        match action {
-                            DevicePanelAction::BackToDashboard => {
-                                self.current_view = View::Dashboard;
-                            }
-                            DevicePanelAction::OpenTerminal(dev_id) => {
-                                self.open_terminal_session(&dev_id);
-                                self.current_view = View::Terminal(dev_id);
-                            }
-                            DevicePanelAction::Disconnect(dev_id) => {
-                                self.disconnect_device(&dev_id);
-                            }
-                            DevicePanelAction::Reconnect(dev_id) => {
-                                self.initiate_connect(&dev_id, None);
-                            }
+                        SidebarAction::OpenGlobalSettings => {
+                            self.active_view = ActiveView::GlobalSettings;
                         }
                     }
-                } else {
-                    ui.label("Device not found.");
-                    if ui.button("Back to Dashboard").clicked() {
-                        self.current_view = View::Dashboard;
-                    }
                 }
-            }
-            View::Terminal(id) => {
-                let id_clone = id.clone();
-                if let Some(dev) = self.devices.get_mut(&id_clone) {
-                    if let Some(action) = terminal::render(ui, dev) {
-                        match action {
-                            TerminalAction::BackToDashboard => {
-                                self.current_view = View::Dashboard;
-                            }
-                            TerminalAction::SendData(data) => {
-                                if let Some(tx) = self.terminal_txs.get(&id_clone) {
-                                    let _ = tx.try_send(TerminalInput {
-                                        input: Some(Input::Data(data)),
-                                    });
-                                }
-                            }
-                            TerminalAction::Clear => {}
-                            TerminalAction::Reconnect => {
-                                self.terminal_txs.remove(&id_clone);
-                                dev.terminal.clear();
-                                self.open_terminal_session(&id_clone);
-                            }
-                        }
-                    }
-                } else {
-                    ui.label("Device not found.");
-                    if ui.button("Back to Dashboard").clicked() {
-                        self.current_view = View::Dashboard;
-                    }
-                }
-            }
-            View::Settings => {
+            });
+
+        // 2. Central Panel: Device Management (with top tabs) or Settings
+        egui::CentralPanel::default().show(ctx, |ui| match self.active_view {
+            ActiveView::GlobalSettings => {
                 if let Some(action) =
                     settings::render(ui, &mut self.settings, &mut self.settings_state)
                 {
                     match action {
                         SettingsAction::BackToDashboard => {
-                            self.current_view = View::Dashboard;
+                            self.active_view = ActiveView::Device;
                         }
                         SettingsAction::Saved => {}
                     }
+                }
+            }
+            ActiveView::Device => {
+                if let Some(id) = self.selected_device_id.clone() {
+                    // Check if we need to auto-open terminal session before mutable borrow of devices
+                    let should_open_term = self.device_panel_state.active_tab == DeviceTab::Terminal
+                        && self
+                            .devices
+                            .get(&id)
+                            .map(|d| d.status.is_connected())
+                            .unwrap_or(false)
+                        && !self.terminal_txs.contains_key(&id);
+
+                    if should_open_term {
+                        self.open_terminal_session(&id);
+                    }
+
+                    if let Some(dev) = self.devices.get_mut(&id) {
+                        if let Some(action) =
+                            device_panel::render(ui, &mut self.device_panel_state, dev)
+                        {
+                            match action {
+                                DevicePanelAction::Connect { id: dev_id, psk } => {
+                                    self.initiate_connect(&dev_id, psk);
+                                }
+                                DevicePanelAction::Disconnect(dev_id) => {
+                                    self.disconnect_device(&dev_id);
+                                }
+                                DevicePanelAction::Reconnect(dev_id) => {
+                                    self.disconnect_device(&dev_id);
+                                    self.initiate_connect(&dev_id, None);
+                                }
+                                DevicePanelAction::Remove(dev_id) => {
+                                    self.disconnect_device(&dev_id);
+                                    self.devices.remove(&dev_id);
+                                    self.settings.device_psks.remove(&dev_id);
+                                    self.settings
+                                        .manual_devices
+                                        .retain(|m| format!("{}:{}", m.address, m.port) != dev_id);
+                                    self.save_known_devices();
+                                    self.selected_device_id = self.devices.keys().next().cloned();
+                                }
+                                DevicePanelAction::SavePsk { id: dev_id, psk } => {
+                                    if let Some(d) = self.devices.get_mut(&dev_id) {
+                                        d.psk = Some(psk.clone());
+                                    }
+                                    self.settings.device_psks.insert(dev_id, psk);
+                                    self.save_known_devices();
+                                }
+                                DevicePanelAction::SwitchTab(tab) => {
+                                    if tab == DeviceTab::Terminal
+                                        && dev.status.is_connected()
+                                        && !self.terminal_txs.contains_key(&id)
+                                    {
+                                        // Terminal will be auto-opened on next frame
+                                    }
+                                }
+                                DevicePanelAction::TerminalAction(term_action) => {
+                                    match term_action {
+                                        TerminalAction::SendData(data) => {
+                                            if let Some(tx) = self.terminal_txs.get(&id) {
+                                                let _ = tx.try_send(TerminalInput {
+                                                    input: Some(Input::Data(data)),
+                                                });
+                                            }
+                                        }
+                                        TerminalAction::Clear => {}
+                                        TerminalAction::Reconnect => {
+                                            self.terminal_txs.remove(&id);
+                                            dev.terminal.clear();
+                                            self.open_terminal_session(&id);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Selected ID no longer in list, fall back to first device or none
+                        self.selected_device_id = self.devices.keys().next().cloned();
+                    }
+                } else {
+                    // Empty state when no device exists or none is selected
+                    ui.add_space(40.0);
+                    ui.vertical_centered(|ui| {
+                        ui.heading("⚡ Bienvenue sur NTX Panel");
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Sélectionnez un serveur dans la colonne de gauche ou ajoutez une nouvelle connexion.",
+                            )
+                            .size(14.0)
+                            .weak(),
+                        );
+                        ui.add_space(20.0);
+                        ui.horizontal(|ui| {
+                            let total_w = 320.0;
+                            ui.add_space((ui.available_width() - total_w).max(0.0) / 2.0);
+
+                            if ui.button("➕ Ajouter un serveur manuellement").clicked() {
+                                self.sidebar_state.show_add_modal = true;
+                            }
+
+                            if ui.button("🔄 Scanner le réseau (mDNS)").clicked() {
+                                self.restart_discovery();
+                            }
+                        });
+                    });
                 }
             }
         });

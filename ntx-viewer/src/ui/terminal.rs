@@ -1,8 +1,8 @@
 use crate::state::Device;
 use egui::{Color32, Key, RichText, Stroke, Ui};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalAction {
-    BackToDashboard,
     SendData(Vec<u8>),
     Clear,
     Reconnect,
@@ -11,24 +11,24 @@ pub enum TerminalAction {
 pub fn render(ui: &mut Ui, device: &mut Device) -> Option<TerminalAction> {
     let mut action = None;
 
-    // Header bar
+    // Terminal Toolbar
     ui.horizontal(|ui| {
-        if ui.button("⬅ Dashboard").clicked() {
-            action = Some(TerminalAction::BackToDashboard);
-        }
-
-        ui.separator();
-        ui.heading(format!("💻 Remote Terminal — {}", device.hostname));
+        ui.label(
+            RichText::new("🐚 Session Terminal (xterm-256color)")
+                .monospace()
+                .size(12.0)
+                .color(Color32::from_rgb(160, 165, 175)),
+        );
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("🧹 Clear").clicked() {
+            if ui.button("🧹 Effacer").on_hover_text("Effacer l'historique d'affichage").clicked() {
                 device.terminal.clear();
                 action = Some(TerminalAction::Clear);
             }
 
             if ui
-                .button("🔄 Reconnect")
-                .on_hover_text("Restart terminal session")
+                .button("🔄 Reconnecter")
+                .on_hover_text("Relancer la session terminal")
                 .clicked()
             {
                 action = Some(TerminalAction::Reconnect);
@@ -36,7 +36,7 @@ pub fn render(ui: &mut Ui, device: &mut Device) -> Option<TerminalAction> {
 
             if ui
                 .button("⏏ Ctrl+D")
-                .on_hover_text("Send EOF (0x04)")
+                .on_hover_text("Envoyer EOF (0x04)")
                 .clicked()
             {
                 action = Some(TerminalAction::SendData(vec![0x04]));
@@ -44,24 +44,18 @@ pub fn render(ui: &mut Ui, device: &mut Device) -> Option<TerminalAction> {
 
             if ui
                 .button("⏹ Ctrl+C")
-                .on_hover_text("Send SIGINT (0x03)")
+                .on_hover_text("Envoyer SIGINT (0x03)")
                 .clicked()
             {
                 action = Some(TerminalAction::SendData(vec![0x03]));
             }
-
-            ui.label(
-                RichText::new(format!("{}:{}", device.primary_address(), device.port))
-                    .weak()
-                    .small(),
-            );
         });
     });
 
-    ui.separator();
+    ui.add_space(4.0);
 
     // Terminal Screen Area
-    let avail_height = (ui.available_height() - 48.0).max(120.0);
+    let avail_height = (ui.available_height() - 44.0).max(120.0);
 
     egui::Frame::canvas(ui.style())
         .fill(Color32::from_rgb(18, 18, 20))
@@ -79,7 +73,7 @@ pub fn render(ui: &mut Ui, device: &mut Device) -> Option<TerminalAction> {
                     {
                         ui.label(
                             RichText::new(
-                                "Terminal ready. Type a command below and press Enter...",
+                                "Terminal prêt. Tapez une commande ci-dessous et appuyez sur Entrée...",
                             )
                             .color(Color32::from_rgb(120, 120, 130))
                             .monospace(),
@@ -173,11 +167,11 @@ pub fn render(ui: &mut Ui, device: &mut Device) -> Option<TerminalAction> {
             egui::TextEdit::singleline(&mut device.terminal.input_buffer)
                 .font(egui::TextStyle::Monospace)
                 .desired_width(ui.available_width() - 80.0)
-                .hint_text("Type command and press Enter..."),
+                .hint_text("Tapez une commande et appuyez sur Entrée..."),
         );
 
         let enter_pressed = ui.input(|i| i.key_pressed(Key::Enter));
-        let send_clicked = ui.button("Send ⏎").clicked();
+        let send_clicked = ui.button("Envoyer ⏎").clicked();
 
         if (input_resp.lost_focus() && enter_pressed)
             || (input_resp.has_focus() && enter_pressed)
