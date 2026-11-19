@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # NTX Panel Server Agent — Automated Installer
-# Supported OS: Linux (Debian/Ubuntu, Arch Linux, Fedora, Alpine, etc.)
+# Supported OS: Linux with systemd (Debian/Ubuntu, Arch Linux, Fedora, etc.)
 # Supported Arch: x86_64, aarch64 (ARM64 / Raspberry Pi 5)
 # ==============================================================================
 
@@ -54,8 +54,6 @@ install_deps_if_needed() {
             $SUDO pacman -Sy --noconfirm "${missing[@]}" ca-certificates
         elif command -v dnf >/dev/null 2>&1; then
             $SUDO dnf install -y "${missing[@]}" ca-certificates
-        elif command -v apk >/dev/null 2>&1; then
-            $SUDO apk add --no-cache "${missing[@]}" ca-certificates
         fi
     fi
 }
@@ -66,6 +64,13 @@ cleanup() {
     rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
+
+# Resolve script directory safely (empty when piped via curl | bash)
+SCRIPT_PATH="${BASH_SOURCE[0]:-}"
+SCRIPT_DIR=""
+if [ -n "$SCRIPT_PATH" ] && [ -e "$SCRIPT_PATH" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd || true)"
+fi
 
 # 4. Acquire binary
 BINARY_SRC=""
@@ -78,16 +83,20 @@ if [ -n "${NTX_BINARY_PATH:-}" ] && [ -f "$NTX_BINARY_PATH" ]; then
     BINARY_SRC="$TMP_DIR/ntx-server"
 fi
 
-# Check for local pre-compiled binary or tarball (e.g. running from repo or release bundle)
+# Check for local pre-compiled binary
 if [ -z "$BINARY_SRC" ]; then
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd || pwd)"
     SEARCH_PATHS=(
-        "$SCRIPT_DIR/../target/release/ntx-server"
-        "$SCRIPT_DIR/target/release/ntx-server"
-        "$SCRIPT_DIR/ntx-server"
         "./target/release/ntx-server"
         "./ntx-server"
     )
+    if [ -n "$SCRIPT_DIR" ]; then
+        SEARCH_PATHS=(
+            "$SCRIPT_DIR/../target/release/ntx-server"
+            "$SCRIPT_DIR/target/release/ntx-server"
+            "$SCRIPT_DIR/ntx-server"
+            "${SEARCH_PATHS[@]}"
+        )
+    fi
     for p in "${SEARCH_PATHS[@]}"; do
         if [ -f "$p" ]; then
             echo "==> Found local binary at $p"
@@ -98,13 +107,19 @@ if [ -z "$BINARY_SRC" ]; then
     done
 fi
 
+# Check for local release tarball
 if [ -z "$BINARY_SRC" ]; then
     TARBALL_SEARCH_PATHS=(
-        "$SCRIPT_DIR/$TARBALL_NAME"
-        "$SCRIPT_DIR/../dist/$TARBALL_NAME"
         "./dist/$TARBALL_NAME"
         "./$TARBALL_NAME"
     )
+    if [ -n "$SCRIPT_DIR" ]; then
+        TARBALL_SEARCH_PATHS=(
+            "$SCRIPT_DIR/$TARBALL_NAME"
+            "$SCRIPT_DIR/../dist/$TARBALL_NAME"
+            "${TARBALL_SEARCH_PATHS[@]}"
+        )
+    fi
     for t in "${TARBALL_SEARCH_PATHS[@]}"; do
         if [ -f "$t" ]; then
             echo "==> Extracting local release tarball: $t"
@@ -120,49 +135,71 @@ if [ -z "$BINARY_SRC" ]; then
     NTX_REPO="${NTX_REPO:-Nathix111/ntx-panel}"
     NTX_VERSION="${NTX_VERSION:-latest}"
 
-    # Try downloading via GitHub CLI (gh) if available and authenticated (works with private repos!)
     if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
         echo "==> Using authenticated GitHub CLI (gh) to fetch release asset..."
         if [ "$NTX_VERSION" = "latest" ]; then
             gh release download --repo "$NTX_REPO" --pattern "$TARBALL_NAME" --dir "$TMP_DIR" 2>/dev/null || true
+            gh release download --repo "$NTX_REPO" --pattern "SHA256SUMS" --dir "$TMP_DIR" 2>/dev/null || true
         else
             gh release download "$NTX_VERSION" --repo "$NTX_REPO" --pattern "$TARBALL_NAME" --dir "$TMP_DIR" 2>/dev/null || true
+            gh release download "$NTX_VERSION" --repo "$NTX_REPO" --pattern "SHA256SUMS" --dir "$TMP_DIR" 2>/dev/null || true
         fi
     fi
 
-    # Fallback to curl / wget if not fetched via gh
     if [ ! -f "$TMP_DIR/$TARBALL_NAME" ]; then
         if [ "$NTX_VERSION" = "latest" ]; then
-            DOWNLOAD_URL="https://github.com/${NTX_REPO}/releases/latest/download/${TARBALL_NAME}"
+            BASE_URL="https://github.com/${NTX_REPO}/releases/latest/download"
         else
-            DOWNLOAD_URL="https://github.com/${NTX_REPO}/releases/download/${NTX_VERSION}/${TARBALL_NAME}"
+            BASE_URL="https://github.com/${NTX_REPO}/releases/download/${NTX_VERSION}"
         fi
+        DOWNLOAD_URL="${BASE_URL}/${TARBALL_NAME}"
+        SUMS_URL="${BASE_URL}/SHA256SUMS"
 
         echo "==> Downloading ${TARBALL_NAME} from GitHub Releases..."
         echo "    URL: $DOWNLOAD_URL"
 
-        AUTH_HEADER=()
+        AUTH_TOKEN=""
         if command -v gh >/dev/null 2>&1 && GH_AUTH_TOKEN="$(gh auth token 2>/dev/null)" && [ -n "$GH_AUTH_TOKEN" ]; then
-            AUTH_HEADER=(-H "Authorization: Bearer ${GH_AUTH_TOKEN}")
+            AUTH_TOKEN="$GH_AUTH_TOKEN"
         elif [ -n "${GITHUB_TOKEN:-}" ]; then
-            AUTH_HEADER=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+            AUTH_TOKEN="$GITHUB_TOKEN"
         fi
 
         if command -v curl >/dev/null 2>&1; then
-            curl -fSL ${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"} "$DOWNLOAD_URL" -o "$TMP_DIR/$TARBALL_NAME" 2>/dev/null || true
+            CURL_AUTH=()
+            if [ -n "$AUTH_TOKEN" ]; then
+                CURL_AUTH=(-H "Authorization: Bearer ${AUTH_TOKEN}")
+            fi
+            curl -fSL ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$DOWNLOAD_URL" -o "$TMP_DIR/$TARBALL_NAME" 2>/dev/null || true
+            curl -fSL ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$SUMS_URL" -o "$TMP_DIR/SHA256SUMS" 2>/dev/null || true
         else
-            wget -qO "$TMP_DIR/$TARBALL_NAME" "$DOWNLOAD_URL" 2>/dev/null || true
+            WGET_AUTH=()
+            if [ -n "$AUTH_TOKEN" ]; then
+                WGET_AUTH=(--header="Authorization: Bearer ${AUTH_TOKEN}")
+            fi
+            wget -q ${WGET_AUTH[@]+"${WGET_AUTH[@]}"} -O "$TMP_DIR/$TARBALL_NAME" "$DOWNLOAD_URL" 2>/dev/null || true
+            wget -q ${WGET_AUTH[@]+"${WGET_AUTH[@]}"} -O "$TMP_DIR/SHA256SUMS" "$SUMS_URL" 2>/dev/null || true
         fi
     fi
 
     if [ -f "$TMP_DIR/$TARBALL_NAME" ]; then
+        if [ -f "$TMP_DIR/SHA256SUMS" ] && command -v sha256sum >/dev/null 2>&1; then
+            EXPECTED_LINE="$(grep -E "[[:space:]]${TARBALL_NAME}$" "$TMP_DIR/SHA256SUMS" | head -n1 || true)"
+            if [ -n "$EXPECTED_LINE" ]; then
+                echo "==> Verifying SHA-256 checksum for ${TARBALL_NAME}..."
+                if ! (cd "$TMP_DIR" && echo "$EXPECTED_LINE" | sha256sum -c -); then
+                    echo "Error: SHA-256 verification failed for ${TARBALL_NAME}!" >&2
+                    exit 1
+                fi
+            fi
+        fi
         tar -xzf "$TMP_DIR/$TARBALL_NAME" -C "$TMP_DIR"
         BINARY_SRC="$TMP_DIR/ntx-server"
     fi
 fi
 
 # Fallback: build with cargo if local repo and cargo are available
-if [ -z "$BINARY_SRC" ] && [ -f "$SCRIPT_DIR/../Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+if [ -z "$BINARY_SRC" ] && [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
     echo "==> Prebuilt binary not found. Building locally via cargo build --release -p ntx-server..."
     (cd "$SCRIPT_DIR/.." && cargo build --release -p ntx-server)
     if [ -f "$SCRIPT_DIR/../target/release/ntx-server" ]; then
@@ -170,7 +207,7 @@ if [ -z "$BINARY_SRC" ] && [ -f "$SCRIPT_DIR/../Cargo.toml" ] && command -v carg
     fi
 fi
 
-if [ ! -f "$BINARY_SRC" ]; then
+if [ -z "$BINARY_SRC" ] || [ ! -f "$BINARY_SRC" ]; then
     echo "Error: Failed to obtain ntx-server binary for $ARCH." >&2
     exit 1
 fi
@@ -185,7 +222,7 @@ $SUDO install -m 755 "$BINARY_SRC" /usr/local/bin/ntx-server
 # Install uninstall helper to /usr/local/bin/ntx-uninstall if available
 if [ -f "$TMP_DIR/uninstall.sh" ]; then
     $SUDO install -m 755 "$TMP_DIR/uninstall.sh" /usr/local/bin/ntx-uninstall
-elif [ -f "${SCRIPT_DIR:-}/uninstall.sh" ]; then
+elif [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
     $SUDO install -m 755 "$SCRIPT_DIR/uninstall.sh" /usr/local/bin/ntx-uninstall
 fi
 
@@ -193,17 +230,16 @@ fi
 if command -v systemctl >/dev/null 2>&1; then
     echo "==> Registering systemd service..."
     $SUDO /usr/local/bin/ntx-server install
-    $SUDO systemctl daemon-reload || true
-    $SUDO systemctl restart ntx-server.service || true
 else
     echo "Notice: systemctl not found; skipping automatic service registration."
     echo "You can launch ntx-server directly by running: /usr/local/bin/ntx-server run"
 fi
 
-# 7. Retrieve and display Pre-Shared Key (PSK)
+# 7. Retrieve and display Pre-Shared Key (PSK) and TLS Fingerprint
 echo "==> Retrieving configuration and credentials..."
 CONFIG_OUTPUT="$($SUDO /usr/local/bin/ntx-server config 2>/dev/null || true)"
-PSK=$(echo "$CONFIG_OUTPUT" | grep -E '^[[:space:]]*psk[[:space:]]*=' | head -n1 | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/' || true)
+PSK="$(echo "$CONFIG_OUTPUT" | grep -E '^[[:space:]]*psk[[:space:]]*=' | head -n1 | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/' || true)"
+TLS_FP="$(echo "$CONFIG_OUTPUT" | grep -E '^TLS Fingerprint[[:space:]]*:' | head -n1 | sed -E 's/^TLS Fingerprint[[:space:]]*:[[:space:]]*//' || true)"
 HOSTNAME_STR="$(hostname 2>/dev/null || echo "ntx-device")"
 
 echo ""
@@ -217,12 +253,13 @@ if command -v systemctl >/dev/null 2>&1; then
 echo "  Systemd Service : ntx-server.service (active & enabled)"
 fi
 echo "  Pre-Shared Key  : ${PSK:-<Run 'sudo ntx-server config' to view>}"
+echo "  TLS Fingerprint : ${TLS_FP:-<Run 'sudo ntx-server config' to view>}"
 echo "------------------------------------------------------------------"
 echo "  CONNECTING FROM NTX VIEWER:"
 echo "  1. Launch ntx-viewer on your management machine."
 echo "  2. The agent will be discovered automatically via mDNS, or add"
 echo "     it using this device's IP and port 9850."
-echo "  3. Enter the Pre-Shared Key (PSK) shown above to authenticate."
+echo "  3. Enter the Pre-Shared Key (PSK) and verify the TLS Fingerprint."
 echo "------------------------------------------------------------------"
 echo "  COMMANDS:"
 echo "  - Check status  : sudo ntx-server status"

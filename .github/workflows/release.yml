@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag or version for the release (e.g. v0.1.0)'
+        description: 'Tag or version for the release (e.g. v0.2.0)'
         required: false
         default: 'latest'
 
@@ -15,8 +15,27 @@ permissions:
   contents: write
 
 jobs:
+  check-and-test:
+    name: Clippy & Workspace Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run Tests
+        run: cargo test --workspace
+
   build-server-linux:
     name: Build Linux Server (${{ matrix.arch }})
+    needs: check-and-test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -92,20 +111,23 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: List release assets
+      - name: Generate checksums & list release assets
         run: |
-          ls -lh artifacts/
           cp scripts/install.sh artifacts/
           cp scripts/uninstall.sh artifacts/
+          (cd artifacts && sha256sum *.tar.gz > SHA256SUMS)
           ls -lh artifacts/
+          cat artifacts/SHA256SUMS
 
       - name: Publish Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.tag_name != '' && inputs.tag_name != 'latest')
         with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.tag_name }}
           files: |
             artifacts/ntx-server-linux-x86_64.tar.gz
             artifacts/ntx-server-linux-aarch64.tar.gz
+            artifacts/SHA256SUMS
             artifacts/install.sh
             artifacts/uninstall.sh
           generate_release_notes: true

@@ -4,6 +4,7 @@
 # Builds release binaries, strips symbols, and creates release tarballs:
 #   - dist/ntx-server-linux-x86_64.tar.gz
 #   - dist/ntx-server-linux-aarch64.tar.gz
+#   - dist/SHA256SUMS
 # ==============================================================================
 
 set -euo pipefail
@@ -14,8 +15,12 @@ DIST_DIR="$ROOT_DIR/dist"
 
 mkdir -p "$DIST_DIR"
 
-# Targets to build (can pass custom target as argument)
-TARGETS=("${@:-x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu}")
+# Targets to build (can pass custom targets as arguments)
+if [ "$#" -gt 0 ]; then
+    TARGETS=("$@")
+else
+    TARGETS=("x86_64-unknown-linux-gnu" "aarch64-unknown-linux-gnu")
+fi
 
 echo "=================================================================="
 echo "               NTX SERVER RELEASE PACKAGING                       "
@@ -49,7 +54,6 @@ for target in "${TARGETS[@]}"; do
 
     echo "==> Building ntx-server for $target ($ARCH)..."
 
-    # Use cross if target does not match host architecture or if cross is available
     BUILD_TOOL="cargo"
     if [ "$ARCH" = "aarch64" ] && [ "$(uname -m)" != "aarch64" ]; then
         if command -v cross >/dev/null 2>&1; then
@@ -68,7 +72,6 @@ for target in "${TARGETS[@]}"; do
         exit 1
     fi
 
-    # Create staging folder for tarball
     STAGE_DIR="$DIST_DIR/stage-$ARCH"
     rm -rf "$STAGE_DIR"
     mkdir -p "$STAGE_DIR"
@@ -78,7 +81,6 @@ for target in "${TARGETS[@]}"; do
     cp "$SCRIPT_DIR/uninstall.sh" "$STAGE_DIR/uninstall.sh"
     chmod +x "$STAGE_DIR"/*
 
-    # Strip binary if strip command is available and works on this architecture
     if command -v "$STRIP_CMD" >/dev/null 2>&1; then
         echo "    Stripping symbols with $STRIP_CMD..."
         "$STRIP_CMD" "$STAGE_DIR/ntx-server" 2>/dev/null || true
@@ -104,7 +106,7 @@ ls -lh "$DIST_DIR"/*.tar.gz || true
 
 if command -v sha256sum >/dev/null 2>&1; then
     echo ""
-    echo "==> SHA-256 Checksums:"
-    (cd "$DIST_DIR" && sha256sum *.tar.gz)
+    echo "==> Generating SHA256SUMS:"
+    (cd "$DIST_DIR" && sha256sum *.tar.gz | tee SHA256SUMS)
 fi
 echo "=================================================================="

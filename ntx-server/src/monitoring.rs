@@ -58,10 +58,16 @@ pub fn collect_system_info(config: &Config) -> SystemInfo {
     }
 }
 
+pub fn scale_bytes_per_sec(delta_bytes: u64, elapsed_secs: f64) -> u64 {
+    let dt = elapsed_secs.max(0.05);
+    (delta_bytes as f64 / dt).round() as u64
+}
+
 pub fn collect_metrics(
     sys: &mut System,
     disks: &mut Disks,
     networks: &mut Networks,
+    elapsed_secs: f64,
 ) -> SystemMetrics {
     sys.refresh_cpu_all();
     sys.refresh_memory();
@@ -78,12 +84,13 @@ pub fn collect_metrics(
             let total = disk.total_space();
             let avail = disk.available_space();
             let used = total.saturating_sub(avail);
+            let usage = disk.usage();
             DiskMetrics {
                 mount_point: disk.mount_point().to_string_lossy().to_string(),
                 used_bytes: used,
                 total_bytes: total,
-                read_bytes_per_sec: 0,
-                write_bytes_per_sec: 0,
+                read_bytes_per_sec: scale_bytes_per_sec(usage.read_bytes, elapsed_secs),
+                write_bytes_per_sec: scale_bytes_per_sec(usage.written_bytes, elapsed_secs),
             }
         })
         .collect();
@@ -92,8 +99,8 @@ pub fn collect_metrics(
         .iter()
         .map(|(name, data)| NetworkMetrics {
             interface_name: name.clone(),
-            rx_bytes_per_sec: data.received(),
-            tx_bytes_per_sec: data.transmitted(),
+            rx_bytes_per_sec: scale_bytes_per_sec(data.received(), elapsed_secs),
+            tx_bytes_per_sec: scale_bytes_per_sec(data.transmitted(), elapsed_secs),
         })
         .collect();
 
@@ -133,8 +140,17 @@ mod tests {
         let mut disks = Disks::new_with_refreshed_list();
         let mut networks = Networks::new_with_refreshed_list();
 
-        let metrics = collect_metrics(&mut sys, &mut disks, &mut networks);
+        let metrics = collect_metrics(&mut sys, &mut disks, &mut networks, 1.0);
         assert!(metrics.total_memory_bytes > 0);
         assert!(metrics.timestamp_ms > 0);
+    }
+
+    #[test]
+    fn test_scale_bytes_per_sec() {
+        assert_eq!(scale_bytes_per_sec(1000, 1.0), 1000);
+        assert_eq!(scale_bytes_per_sec(1000, 0.25), 4000);
+        assert_eq!(scale_bytes_per_sec(1000, 2.0), 500);
+        // Guard against near-zero dt
+        assert_eq!(scale_bytes_per_sec(100, 0.0), 2000);
     }
 }

@@ -58,14 +58,6 @@ if [ -f "$UNINSTALL_HELPER" ]; then
     $SUDO rm -f "$UNINSTALL_HELPER"
 fi
 
-# Clean up any leftover archive or extracted files in current directory if present
-for residual in "ntx-server" "ntx-server-linux-aarch64.tar.gz" "ntx-server-linux-x86_64.tar.gz"; do
-    if [ -f "./$residual" ]; then
-        echo "==> Removing local artifact ./$residual..."
-        $SUDO rm -f "./$residual"
-    fi
-done
-
 # 6. Wipe configuration directories
 echo "==> Purging configuration directories..."
 CONFIG_DIRS=(
@@ -73,11 +65,18 @@ CONFIG_DIRS=(
     "/root/.config/ntx-server"
 )
 
-if [ -n "${SUDO_USER:-}" ]; then
-    CONFIG_DIRS+=("/home/${SUDO_USER}/.config/ntx-server")
+if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+    SUDO_HOME=""
+    if command -v getent >/dev/null 2>&1; then
+        SUDO_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6 || true)"
+    fi
+    if [ -z "$SUDO_HOME" ]; then
+        SUDO_HOME="/home/${SUDO_USER}"
+    fi
+    CONFIG_DIRS+=("${SUDO_HOME}/.config/ntx-server")
 fi
 
-if [ -n "${HOME:-}" ] && [ "${HOME:-}" != "/root" ]; then
+if [ -n "${HOME:-}" ] && [ "${HOME}" != "/root" ]; then
     CONFIG_DIRS+=("${HOME}/.config/ntx-server")
 fi
 

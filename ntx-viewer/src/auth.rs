@@ -1,11 +1,24 @@
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-/// Hash a Pre-Shared Key (PSK) using SHA-256 and return hex string.
-pub fn hash_psk(psk: &str) -> String {
+type HmacSha256 = Hmac<Sha256>;
+
+/// Derive a 32-byte key from a Pre-Shared Key (PSK) using SHA-256.
+pub fn derive_psk_key(psk: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(psk.as_bytes());
-    hex::encode(hasher.finalize())
+    hasher.finalize().into()
+}
+
+/// Compute the challenge-response HMAC-SHA256 hex digest matching `ntx-server`.
+pub fn compute_challenge_hmac(psk: &str, nonce: &[u8], viewer_id: &str) -> String {
+    let key = derive_psk_key(psk);
+    let mut mac = HmacSha256::new_from_slice(&key).expect("HMAC accepts any key size");
+    mac.update(nonce);
+    mac.update(b":");
+    mac.update(viewer_id.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
 }
 
 /// Generate a new unique viewer ID (UUID v4).
@@ -18,15 +31,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hash_psk() {
+    fn test_compute_challenge_hmac() {
         let psk = "secret123";
-        let hash = hash_psk(psk);
-        assert_eq!(hash.len(), 64);
-        // SHA-256 of "secret123" is well-known:
-        // echo -n "secret123" | sha256sum -> 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8 (wait, let's test determinism)
-        let hash2 = hash_psk(psk);
-        assert_eq!(hash, hash2);
-        assert_ne!(hash, hash_psk("other"));
+        let nonce = b"nonce_bytes";
+        let viewer = "viewer-1";
+        let mac1 = compute_challenge_hmac(psk, nonce, viewer);
+        let mac2 = compute_challenge_hmac(psk, nonce, viewer);
+        assert_eq!(mac1.len(), 64);
+        assert_eq!(mac1, mac2);
+        assert_ne!(mac1, compute_challenge_hmac("other", nonce, viewer));
+        assert_ne!(mac1, compute_challenge_hmac(psk, b"other", viewer));
+        assert_ne!(mac1, compute_challenge_hmac(psk, nonce, "viewer-2"));
     }
 
     #[test]

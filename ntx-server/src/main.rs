@@ -3,9 +3,11 @@
 use anyhow::Result;
 use ntx_proto::ntx_agent_server::NtxAgentServer;
 use ntx_server::auth::AuthManager;
-use ntx_server::config::{default_config_path, get_hostname, load_or_create};
+use ntx_server::config::{
+    config_dir_for_path, default_config_path, get_hostname, load_or_create_from_path,
+};
 use ntx_server::server::NtxAgentService;
-use ntx_server::{discovery, service};
+use ntx_server::{discovery, service, tls};
 use std::net::SocketAddr;
 use tonic::transport::Server;
 use tonic::Request;
@@ -20,12 +22,12 @@ Usage:
 
 Commands:
     run            Run the agent server in foreground (default)
-    install        Install the agent as a system service
-    uninstall      Uninstall the agent system service
+    install        Install the agent as a Linux systemd service
+    uninstall      Uninstall the agent Linux systemd service
                    Options:
                      --purge, -p    Remove binary and wipe all configuration directories
-    status         Show the status of the agent service
-    config         Print the path and contents of the configuration file
+    status         Show the status of the agent systemd service
+    config         Print the configuration path, TOML, and TLS fingerprint
     help, --help   Show this help message
 "#,
         env!("CARGO_PKG_VERSION")
@@ -34,6 +36,8 @@ Commands:
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let args: Vec<String> = std::env::args().collect();
 
     let is_help = args
@@ -77,6 +81,17 @@ async fn main() -> Result<()> {
             if path.exists() {
                 let content = std::fs::read_to_string(&path)?;
                 println!("\n{}", content);
+
+                let config_dir = config_dir_for_path(&path);
+                let cert_path = config_dir.join("server.crt");
+                if cert_path.exists() {
+                    if let Ok(cert_pem) = std::fs::read_to_string(&cert_path) {
+                        if let Ok(fp) = tls::cert_fingerprint_from_pem(&cert_pem) {
+                            println!("TLS Certificate  : {}", cert_path.display());
+                            println!("TLS Fingerprint  : {}", tls::format_fingerprint(&fp));
+                        }
+                    }
+                }
             } else {
                 println!("(Config file does not exist yet. Run 'ntx-server run' to initialize.)");
             }
@@ -100,12 +115,42 @@ fn init_logging() {
         .try_init();
 }
 
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received SIGINT, terminating server...");
+            }
+            _ = async {
+                if let Some(ref mut s) = sigterm {
+                    s.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                info!("Received SIGTERM, terminating server...");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("Received shutdown signal, terminating server...");
+    }
+}
+
 async fn run_server() -> Result<()> {
     init_logging();
 
-    let (config, is_new_psk) = load_or_create()?;
     let path = default_config_path();
+    let (config, is_new_psk) = load_or_create_from_path(&path)?;
     let hostname = get_hostname(&config);
+    let config_dir = config_dir_for_path(&path);
+    let tls_material = tls::load_or_generate_tls(&config_dir, &hostname)?;
+    let formatted_fp = tls::format_fingerprint(&tls_material.fingerprint_sha256);
 
     if is_new_psk {
         println!();
@@ -114,11 +159,15 @@ async fn run_server() -> Result<()> {
         println!("==================================================================");
         println!("  Config saved to : {}", path.display());
         println!("  Node Hostname   : {}", hostname);
-        println!("  gRPC Port       : {}", config.server.port);
+        println!(
+            "  gRPC Bind       : {}:{}",
+            config.server.bind_address, config.server.port
+        );
         println!("  Pre-Shared Key  : {}", config.server.psk);
+        println!("  TLS Fingerprint : {}", formatted_fp);
         println!("------------------------------------------------------------------");
         println!("  IMPORTANT: Copy this Pre-Shared Key (PSK) into your ntx-viewer  ");
-        println!("  client to connect securely to this agent.                       ");
+        println!("  client and verify the TLS Fingerprint on first connection.      ");
         println!("==================================================================");
         println!();
     } else {
@@ -126,12 +175,11 @@ async fn run_server() -> Result<()> {
     }
 
     info!(
-        "Starting NTX Server on node '{}' (port {})",
-        hostname, config.server.port
+        "Starting NTX Server on node '{}' ({}:{}, TLS SHA-256: {})",
+        hostname, config.server.bind_address, config.server.port, formatted_fp
     );
 
-    // Start mDNS announcement if enabled
-    let _mdns = match discovery::start_announcement(&config) {
+    let mdns = match discovery::start_announcement(&config, &tls_material.fingerprint_sha256) {
         Ok(daemon) => daemon,
         Err(e) => {
             tracing::error!("Failed to start mDNS announcement: {:#}", e);
@@ -139,22 +187,25 @@ async fn run_server() -> Result<()> {
         }
     };
 
-    let auth_manager = AuthManager::new(&config.server.psk);
+    let auth_manager = AuthManager::new(&config.server.psk, config.server.session_ttl_secs);
     let agent_service = NtxAgentService::new(config.clone(), auth_manager.clone());
 
     let auth_interceptor = auth_manager.clone();
     let interceptor = move |req: Request<()>| auth_interceptor.intercept(req);
 
-    let addr: SocketAddr = format!("0.0.0.0:{}", config.server.port).parse()?;
-    info!("gRPC server listening on {}", addr);
+    let addr: SocketAddr = format!("{}:{}", config.server.bind_address, config.server.port).parse()?;
+    let tls_config = tls::server_tls_config(&tls_material)?;
+    info!("gRPC TLS server listening on https://{}", addr);
 
     Server::builder()
+        .tls_config(tls_config)?
         .add_service(NtxAgentServer::with_interceptor(agent_service, interceptor))
-        .serve_with_shutdown(addr, async {
-            tokio::signal::ctrl_c().await.ok();
-            info!("Received shutdown signal, terminating server...");
-        })
+        .serve_with_shutdown(addr, shutdown_signal())
         .await?;
+
+    if let Some(daemon) = mdns {
+        let _ = daemon.shutdown();
+    }
 
     info!("NTX Server stopped cleanly.");
     Ok(())

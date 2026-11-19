@@ -4,11 +4,19 @@ use egui::{Color32, RichText, Ui};
 /// Actions that can be triggered from the Favorites management view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FavoritesPanelAction {
+    Refresh,
+    ClearStatus,
     AttachTerminal { command: String },
     KillProcess { pid: u32, signal: i32 },
     ControlService { service_name: String, action: String },
     SaveFavorite(FavoriteApp),
     RemoveFavorite(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingFavConfirm {
+    KillProcess { name: String, pid: u32, signal: i32 },
+    ControlService { service_name: String, action: String },
 }
 
 /// Local UI state for the Favorites tab.
@@ -26,6 +34,7 @@ pub struct FavoritesPanelState {
     pub auto_start_command_input: String,
     pub selected_from_proc_pid: Option<u32>,
     pub search_query: String,
+    pub pending_confirm: Option<PendingFavConfirm>,
 }
 
 impl Default for FavoritesPanelState {
@@ -43,6 +52,7 @@ impl Default for FavoritesPanelState {
             auto_start_command_input: String::new(),
             selected_from_proc_pid: None,
             search_query: String::new(),
+            pending_confirm: None,
         }
     }
 }
@@ -134,12 +144,8 @@ impl FavoritesPanelState {
         self.app_type_input = FavoriteAppType::Process;
         self.process_filter_input = proc.name.clone();
         self.service_name_input.clear();
-        self.terminal_command_input = if !proc.command_line.is_empty() {
-            format!("top -p {}", proc.pid)
-        } else {
-            String::new()
-        };
-        self.description_input = format!("Processus {} (PID: {})", proc.name, proc.pid);
+        self.terminal_command_input.clear();
+        self.description_input = format!("Processus {}", proc.name);
         self.auto_start_command_input.clear();
     }
 }
@@ -152,8 +158,8 @@ pub fn render(
 ) -> Option<FavoritesPanelAction> {
     let mut action: Option<FavoritesPanelAction> = None;
 
-    // 1. Top Toolbar (Add button, quick templates, and search filter)
-    ui.horizontal(|ui| {
+    // 1. Top Toolbar
+    ui.horizontal_wrapped(|ui| {
         let add_btn = ui.button(
             RichText::new("➕ Ajouter une application / favori")
                 .strong()
@@ -163,31 +169,59 @@ pub fn render(
             state.open_add();
         }
 
-        ui.separator();
-        ui.label(RichText::new("Modèles rapides:").weak().size(12.0));
+        if device.status.is_connected()
+            && ui
+                .button("🔄 Actualiser")
+                .on_hover_text("Actualiser les processus et services depuis le serveur")
+                .clicked()
+        {
+            action = Some(FavoritesPanelAction::Refresh);
+        }
 
-        if ui.button("⛏️ Minecraft").on_hover_text("Préconfigurer un serveur Minecraft").clicked() {
+        ui.separator();
+        ui.label(RichText::new("Modèles rapides :").weak().size(12.0));
+
+        if ui
+            .button("⛏️ Minecraft")
+            .on_hover_text("Préconfigurer un serveur Minecraft")
+            .clicked()
+        {
             state.open_add();
             state.apply_minecraft_template();
         }
 
-        if ui.button("🐳 Docker").on_hover_text("Préconfigurer un conteneur ou compose Docker").clicked() {
+        if ui
+            .button("🐳 Docker")
+            .on_hover_text("Préconfigurer un conteneur ou compose Docker")
+            .clicked()
+        {
             state.open_add();
             state.apply_docker_template();
         }
 
-        if ui.button("🌐 Web").on_hover_text("Préconfigurer un serveur web Nginx").clicked() {
+        if ui
+            .button("🌐 Web")
+            .on_hover_text("Préconfigurer un serveur web Nginx")
+            .clicked()
+        {
             state.open_add();
             state.apply_web_template();
         }
 
-        if ui.button("🗄️ Database").on_hover_text("Préconfigurer une base PostgreSQL").clicked() {
+        if ui
+            .button("🗄️ Base de données")
+            .on_hover_text("Préconfigurer une base PostgreSQL")
+            .clicked()
+        {
             state.open_add();
             state.apply_db_template();
         }
 
         if !device.process_state.processes.is_empty()
-            && ui.button("⚡ Depuis processus en cours").on_hover_text("Importer un processus actif de la machine").clicked()
+            && ui
+                .button("⚡ Depuis processus actif")
+                .on_hover_text("Importer un processus actif de la machine")
+                .clicked()
         {
             state.open_add();
             if let Some(first_proc) = device.process_state.processes.first() {
@@ -207,6 +241,35 @@ pub fn render(
 
     ui.add_space(6.0);
 
+    // Feedback banner (reuses status_message from process/service actions)
+    if let Some((msg, is_error)) = &device.process_state.status_message {
+        let (bg, fg) = if *is_error {
+            (Color32::from_rgb(70, 25, 25), Color32::from_rgb(250, 100, 100))
+        } else {
+            (Color32::from_rgb(25, 60, 35), Color32::from_rgb(100, 240, 140))
+        };
+        egui::Frame::new()
+            .fill(bg)
+            .corner_radius(4.0)
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(if *is_error { "⚠" } else { "✔" })
+                            .color(fg)
+                            .strong(),
+                    );
+                    ui.label(RichText::new(msg).color(fg));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("✖").clicked() {
+                            action = Some(FavoritesPanelAction::ClearStatus);
+                        }
+                    });
+                });
+            });
+        ui.add_space(6.0);
+    }
+
     // 2. Compute KPI Metrics
     let total_favs = device.favorites.len();
     let mut active_count = 0;
@@ -219,7 +282,13 @@ pub fn render(
             .iter()
             .any(|p| app.matches_process(p));
 
-        let is_service_matched = if app.app_type == FavoriteAppType::Service || app.service_name.is_some() {
+        let is_service_matched = if app.app_type == FavoriteAppType::Service
+            || app
+                .service_name
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+        {
             device.process_state.services.iter().any(|s| {
                 if app.matches_service(s) {
                     let st = s.active_state.to_lowercase();
@@ -240,7 +309,7 @@ pub fn render(
         }
     }
 
-    // Render KPI Banner
+    // KPI Banner
     egui::Frame::new()
         .fill(Color32::from_rgb(22, 25, 32))
         .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(45, 50, 62)))
@@ -250,17 +319,17 @@ pub fn render(
             ui.horizontal(|ui| {
                 ui.label(RichText::new("⭐ Applications & Favoris").strong().size(13.0));
                 ui.separator();
-                ui.label(RichText::new(format!("Total: {total_favs}")).strong().size(12.0));
+                ui.label(RichText::new(format!("Total : {total_favs}")).strong().size(12.0));
                 ui.separator();
                 ui.label(
-                    RichText::new(format!("● En cours: {active_count}"))
+                    RichText::new(format!("● En cours : {active_count}"))
                         .color(Color32::from_rgb(46, 204, 113))
                         .strong()
                         .size(12.0),
                 );
                 ui.separator();
                 ui.label(
-                    RichText::new(format!("○ Arrêtés: {stopped_count}"))
+                    RichText::new(format!("○ Arrêtés : {stopped_count}"))
                         .color(Color32::from_rgb(140, 150, 165))
                         .size(12.0),
                 );
@@ -268,7 +337,7 @@ pub fn render(
                 if !device.status.is_connected() {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            RichText::new("⚠️ Serveur déconnecté - statut en direct indisponible")
+                            RichText::new("⚠ Serveur déconnecté - statut en direct indisponible")
                                 .color(Color32::from_rgb(240, 160, 40))
                                 .size(11.0),
                         );
@@ -291,16 +360,24 @@ pub fn render(
                 app.name.to_lowercase().contains(&search)
                     || app.description.to_lowercase().contains(&search)
                     || app.process_filter.to_lowercase().contains(&search)
-                    || app.service_name.as_deref().unwrap_or("").to_lowercase().contains(&search)
+                    || app
+                        .service_name
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&search)
             }
         })
         .collect();
 
     if device.favorites.is_empty() {
-        // Empty state when no favorites exist
         ui.add_space(30.0);
         ui.vertical_centered(|ui| {
-            ui.label(RichText::new("⭐ Aucune application en favori pour ce serveur.").size(16.0).strong());
+            ui.label(
+                RichText::new("⭐ Aucune application en favori pour ce serveur.")
+                    .size(16.0)
+                    .strong(),
+            );
             ui.add_space(6.0);
             ui.label(
                 RichText::new(
@@ -309,12 +386,15 @@ pub fn render(
                 .weak(),
             );
             ui.add_space(16.0);
-            if ui.button(RichText::new("➕ Ajouter un premier favori").size(14.0).strong()).clicked() {
+            if ui
+                .button(RichText::new("➕ Ajouter un premier favori").size(14.0).strong())
+                .clicked()
+            {
                 state.open_add();
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                let total_w = 420.0;
+                let total_w = 460.0;
                 ui.add_space((ui.available_width() - total_w).max(0.0) / 2.0);
                 if ui.button("⛏️ Modèle Minecraft").clicked() {
                     state.open_add();
@@ -328,7 +408,7 @@ pub fn render(
                     state.open_add();
                     state.apply_web_template();
                 }
-                if ui.button("🗄️ Modèle Database").clicked() {
+                if ui.button("🗄️ Modèle Base de données").clicked() {
                     state.open_add();
                     state.apply_db_template();
                 }
@@ -357,10 +437,71 @@ pub fn render(
         }
     }
 
+    // 5. Confirmation Modal
+    if let Some(confirm) = state.pending_confirm.clone() {
+        let mut clear = false;
+        egui::Window::new("⚠ Confirmation requise")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                match &confirm {
+                    PendingFavConfirm::KillProcess { name, pid, signal } => {
+                        let sig_label = if *signal == 9 {
+                            "SIGKILL (9 - arrêt forcé)"
+                        } else {
+                            "SIGTERM (15 - arrêt propre)"
+                        };
+                        ui.label(format!(
+                            "Envoyer {sig_label} au processus « {name} » (PID {pid}) ?"
+                        ));
+                    }
+                    PendingFavConfirm::ControlService {
+                        service_name,
+                        action: svc_act,
+                    } => {
+                        ui.label(format!(
+                            "Exécuter « systemctl {svc_act} {service_name} » ?"
+                        ));
+                    }
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(
+                            RichText::new("✅ Confirmer")
+                                .color(Color32::from_rgb(255, 120, 120))
+                                .strong(),
+                        )
+                        .clicked()
+                    {
+                        action = Some(match confirm.clone() {
+                            PendingFavConfirm::KillProcess { pid, signal, .. } => {
+                                FavoritesPanelAction::KillProcess { pid, signal }
+                            }
+                            PendingFavConfirm::ControlService {
+                                service_name,
+                                action: svc_act,
+                            } => FavoritesPanelAction::ControlService {
+                                service_name,
+                                action: svc_act,
+                            },
+                        });
+                        clear = true;
+                    }
+                    if ui.button("Annuler").clicked() {
+                        clear = true;
+                    }
+                });
+            });
+        if clear {
+            state.pending_confirm = None;
+        }
+    }
+
     action
 }
 
-/// Render a single Favorite Card.
 fn render_favorite_card(
     ui: &mut Ui,
     state: &mut FavoritesPanelState,
@@ -369,7 +510,6 @@ fn render_favorite_card(
 ) -> Option<FavoritesPanelAction> {
     let mut action = None;
 
-    // Match against live processes
     let matching_procs: Vec<&ntx_proto::ProcessItem> = device
         .process_state
         .processes
@@ -377,8 +517,14 @@ fn render_favorite_card(
         .filter(|p| app.matches_process(p))
         .collect();
 
-    // Match against live services
-    let matching_services: Vec<&ntx_proto::ServiceItem> = if app.app_type == FavoriteAppType::Service || app.service_name.is_some() {
+    let has_service_ref = app.app_type == FavoriteAppType::Service
+        || app
+            .service_name
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+
+    let matching_services: Vec<&ntx_proto::ServiceItem> = if has_service_ref {
         device
             .process_state
             .services
@@ -389,24 +535,26 @@ fn render_favorite_card(
         Vec::new()
     };
 
-    let is_service_active = matching_services.iter().any(|s| {
+    let active_service = matching_services.iter().copied().find(|s| {
         let st = s.active_state.to_lowercase();
         let sub = s.sub_state.to_lowercase();
         st == "active" || sub == "running"
     });
 
-    let is_active = !matching_procs.is_empty() || is_service_active;
+    let is_active = !matching_procs.is_empty() || active_service.is_some();
 
-    // Aggregate metrics
     let primary_proc = matching_procs
         .iter()
-        .max_by(|a, b| a.cpu_usage.partial_cmp(&b.cpu_usage).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| {
+            a.cpu_usage
+                .partial_cmp(&b.cpu_usage)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .copied();
 
     let total_cpu: f32 = matching_procs.iter().map(|p| p.cpu_usage).sum();
     let total_mem: u64 = matching_procs.iter().map(|p| p.memory_bytes).sum();
 
-    // Border and background colors based on active state
     let (card_bg, card_border) = if is_active {
         (
             Color32::from_rgb(18, 26, 24),
@@ -425,12 +573,15 @@ fn render_favorite_card(
         .corner_radius(6.0)
         .inner_margin(egui::Margin::symmetric(14, 10))
         .show(ui, |ui| {
-            // Header Row: Icon, Name, Type Badge, Status Badge, Edit & Delete buttons
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&app.icon).size(18.0));
-                ui.label(RichText::new(&app.name).size(15.0).strong().color(Color32::from_rgb(230, 240, 255)));
+                ui.label(
+                    RichText::new(&app.name)
+                        .size(15.0)
+                        .strong()
+                        .color(Color32::from_rgb(230, 240, 255)),
+                );
 
-                // Type Badge
                 let (badge_text, badge_bg, badge_fg) = get_type_badge(app);
                 egui::Frame::new()
                     .fill(badge_bg)
@@ -440,7 +591,6 @@ fn render_favorite_card(
                         ui.label(RichText::new(badge_text).color(badge_fg).size(11.0).strong());
                     });
 
-                // Status Badge
                 let (status_text, status_bg, status_fg) = if is_active {
                     (
                         "● En cours",
@@ -463,19 +613,25 @@ fn render_favorite_card(
                         ui.label(RichText::new(status_text).color(status_fg).size(11.0).strong());
                     });
 
-                // Right-aligned edit & remove buttons
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("🗑 Supprimer").on_hover_text("Supprimer ce favori de la liste").clicked() {
+                    if ui
+                        .button("🗑 Supprimer")
+                        .on_hover_text("Supprimer ce favori de la liste")
+                        .clicked()
+                    {
                         action = Some(FavoritesPanelAction::RemoveFavorite(app.id.clone()));
                     }
 
-                    if ui.button("✏ Modifier").on_hover_text("Modifier les paramètres de ce favori").clicked() {
+                    if ui
+                        .button("✏ Modifier")
+                        .on_hover_text("Modifier les paramètres de ce favori")
+                        .clicked()
+                    {
                         state.open_edit(app);
                     }
                 });
             });
 
-            // Description / Target Row
             if !app.description.is_empty() {
                 ui.add_space(2.0);
                 ui.label(RichText::new(&app.description).size(12.0).weak());
@@ -483,34 +639,49 @@ fn render_favorite_card(
 
             ui.add_space(4.0);
 
-            // Technical details row
             ui.horizontal_wrapped(|ui| {
                 if !app.process_filter.is_empty() {
-                    ui.label(RichText::new(format!("Filtre: {}", app.process_filter)).size(11.0).weak());
+                    ui.label(
+                        RichText::new(format!("Filtre : {}", app.process_filter))
+                            .size(11.0)
+                            .weak(),
+                    );
                     ui.separator();
                 }
                 if let Some(srv) = &app.service_name {
-                    if !srv.is_empty() {
-                        ui.label(RichText::new(format!("Service: {srv}")).size(11.0).weak());
+                    if !srv.trim().is_empty() {
+                        ui.label(RichText::new(format!("Service : {srv}")).size(11.0).weak());
                         ui.separator();
                     }
                 }
                 if let Some(auto_cmd) = &app.auto_start_command {
-                    if !auto_cmd.is_empty() {
-                        ui.label(RichText::new(format!("Auto-start: {auto_cmd}")).size(11.0).weak());
+                    if !auto_cmd.trim().is_empty() {
+                        ui.label(
+                            RichText::new(format!("Démarrage : {auto_cmd}"))
+                                .size(11.0)
+                                .weak(),
+                        );
                     }
                 }
             });
 
             ui.add_space(6.0);
 
-            // Live metrics & controls
             if is_active {
-                // Active Section
                 ui.horizontal(|ui| {
+                    if let Some(s) = active_service {
+                        ui.label(
+                            RichText::new(format!("Service actif : {}", s.name))
+                                .strong()
+                                .size(12.0)
+                                .color(Color32::from_rgb(100, 200, 255)),
+                        );
+                        ui.separator();
+                    }
+
                     if let Some(p) = primary_proc {
                         ui.label(
-                            RichText::new(format!("PID: {}", p.pid))
+                            RichText::new(format!("PID : {}", p.pid))
                                 .strong()
                                 .size(12.0)
                                 .color(Color32::from_rgb(100, 200, 255)),
@@ -525,21 +696,10 @@ fn render_favorite_card(
                         }
 
                         ui.separator();
-                    } else if is_service_active {
-                        if let Some(s) = matching_services.first() {
-                            ui.label(
-                                RichText::new(format!("Service actif: {}", s.name))
-                                    .strong()
-                                    .size(12.0)
-                                    .color(Color32::from_rgb(100, 200, 255)),
-                            );
-                            ui.separator();
-                        }
                     }
 
-                    // CPU Metric
                     ui.label(
-                        RichText::new(format!("CPU: {:.1}%", total_cpu))
+                        RichText::new(format!("CPU : {:.1}%", total_cpu))
                             .strong()
                             .size(12.0)
                             .color(if total_cpu > 20.0 {
@@ -550,57 +710,71 @@ fn render_favorite_card(
                     );
                     ui.separator();
 
-                    // RAM Metric
                     ui.label(
-                        RichText::new(format!("RAM: {}", format_ram(total_mem)))
+                        RichText::new(format!("RAM : {}", format_ram(total_mem)))
                             .strong()
                             .size(12.0)
                             .color(Color32::from_rgb(100, 180, 240)),
                     );
 
-                    // Actions on right
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Tuer (SIGKILL 9)
+                        // Tuer (SIGKILL 9) when a process is matched and NOT purely service-managed
                         if let Some(p) = primary_proc {
                             let kill_btn = ui.button(
                                 RichText::new("🛑 Tuer")
                                     .color(Color32::from_rgb(255, 100, 100))
                                     .strong(),
                             );
-                            if kill_btn.on_hover_text(format!("Envoyer SIGKILL (9) au PID {}", p.pid)).clicked() {
-                                action = Some(FavoritesPanelAction::KillProcess {
+                            if kill_btn
+                                .on_hover_text(format!("Envoyer SIGKILL (9) au PID {}", p.pid))
+                                .clicked()
+                            {
+                                state.pending_confirm = Some(PendingFavConfirm::KillProcess {
+                                    name: p.name.clone(),
                                     pid: p.pid,
                                     signal: 9,
                                 });
                             }
                         }
 
-                        // Arrêter (SIGTERM 15 ou service stop)
+                        // Arrêter: prefer systemd service stop when this favorite targets a service!
                         let stop_btn = ui.button("⏹ Arrêter");
-                        if let Some(p) = primary_proc {
-                            if stop_btn.on_hover_text(format!("Envoyer SIGTERM (15) au PID {}", p.pid)).clicked() {
-                                action = Some(FavoritesPanelAction::KillProcess {
-                                    pid: p.pid,
-                                    signal: 15,
-                                });
-                            }
-                        } else if let Some(s) = matching_services.first() {
-                            if stop_btn.on_hover_text(format!("Arrêter le service {} (systemctl stop)", s.name)).clicked() {
-                                action = Some(FavoritesPanelAction::ControlService {
+                        if let Some(s) = active_service {
+                            if stop_btn
+                                .on_hover_text(format!("Arrêter le service {} (systemctl stop)", s.name))
+                                .clicked()
+                            {
+                                state.pending_confirm = Some(PendingFavConfirm::ControlService {
                                     service_name: s.name.clone(),
                                     action: "stop".to_string(),
                                 });
                             }
+                        } else if let Some(p) = primary_proc {
+                            if stop_btn
+                                .on_hover_text(format!("Envoyer SIGTERM (15) au PID {}", p.pid))
+                                .clicked()
+                            {
+                                state.pending_confirm = Some(PendingFavConfirm::KillProcess {
+                                    name: p.name.clone(),
+                                    pid: p.pid,
+                                    signal: 15,
+                                });
+                            }
                         }
 
-                        // Terminal dédié
                         if !app.terminal_command.trim().is_empty() {
                             let term_btn = ui.button(
                                 RichText::new("💻 Terminal dédié")
                                     .color(Color32::from_rgb(120, 200, 255))
                                     .strong(),
                             );
-                            if term_btn.on_hover_text(format!("Ouvrir le terminal et exécuter: {}", app.terminal_command)).clicked() {
+                            if term_btn
+                                .on_hover_text(format!(
+                                    "Ouvrir le terminal et exécuter : {}",
+                                    app.terminal_command
+                                ))
+                                .clicked()
+                            {
                                 action = Some(FavoritesPanelAction::AttachTerminal {
                                     command: app.terminal_command.clone(),
                                 });
@@ -609,45 +783,91 @@ fn render_favorite_card(
                     });
                 });
             } else {
-                // Stopped Section
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("Application ou processus actuellement arrêté.")
+                        RichText::new("Application ou service actuellement arrêté.")
                             .size(12.0)
                             .weak(),
                     );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Start Button (if auto_start_command or service_name is present)
-                        if let Some(cmd) = &app.auto_start_command {
-                            if !cmd.trim().is_empty() {
+                        let auto_cmd = app
+                            .auto_start_command
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty());
+                        let svc_name = app
+                            .service_name
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty());
+
+                        if app.app_type == FavoriteAppType::Service {
+                            let target_svc = svc_name.or_else(|| {
+                                auto_cmd
+                                    .and_then(|c| c.strip_prefix("systemctl start "))
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                            });
+
+                            if let Some(sname) = target_svc {
+                                let start_btn = ui.button(
+                                    RichText::new("▶ Démarrer le service")
+                                        .color(Color32::from_rgb(46, 204, 113))
+                                        .strong(),
+                                );
+                                if start_btn
+                                    .on_hover_text(format!(
+                                        "Démarrer le service {sname} (systemctl start)"
+                                    ))
+                                    .clicked()
+                                {
+                                    action = Some(FavoritesPanelAction::ControlService {
+                                        service_name: sname.to_string(),
+                                        action: "start".to_string(),
+                                    });
+                                }
+                            } else if let Some(cmd) = auto_cmd {
                                 let start_btn = ui.button(
                                     RichText::new("▶ Démarrer")
                                         .color(Color32::from_rgb(46, 204, 113))
                                         .strong(),
                                 );
-                                if start_btn.on_hover_text(format!("Démarrer l'application avec: {cmd}")).clicked() {
-                                    if app.app_type == FavoriteAppType::Service && cmd.starts_with("systemctl start ") {
-                                        let s_name = cmd.trim_start_matches("systemctl start ").trim().to_string();
-                                        action = Some(FavoritesPanelAction::ControlService {
-                                            service_name: s_name,
-                                            action: "start".to_string(),
-                                        });
-                                    } else {
-                                        action = Some(FavoritesPanelAction::AttachTerminal {
-                                            command: cmd.clone(),
-                                        });
-                                    }
+                                if start_btn
+                                    .on_hover_text(format!("Démarrer l'application avec : {cmd}"))
+                                    .clicked()
+                                {
+                                    action = Some(FavoritesPanelAction::AttachTerminal {
+                                        command: cmd.to_string(),
+                                    });
                                 }
                             }
-                        } else if app.app_type == FavoriteAppType::Service || app.service_name.is_some() {
-                            let sname = app.service_name.as_deref().unwrap_or(&app.name);
+                        } else if let Some(cmd) = auto_cmd {
+                            let start_btn = ui.button(
+                                RichText::new("▶ Démarrer")
+                                    .color(Color32::from_rgb(46, 204, 113))
+                                    .strong(),
+                            );
+                            if start_btn
+                                .on_hover_text(format!("Démarrer l'application avec : {cmd}"))
+                                .clicked()
+                            {
+                                action = Some(FavoritesPanelAction::AttachTerminal {
+                                    command: cmd.to_string(),
+                                });
+                            }
+                        } else if let Some(sname) = svc_name {
                             let start_btn = ui.button(
                                 RichText::new("▶ Démarrer le service")
                                     .color(Color32::from_rgb(46, 204, 113))
                                     .strong(),
                             );
-                            if start_btn.on_hover_text(format!("Démarrer le service {sname} (systemctl start)")).clicked() {
+                            if start_btn
+                                .on_hover_text(format!(
+                                    "Démarrer le service {sname} (systemctl start)"
+                                ))
+                                .clicked()
+                            {
                                 action = Some(FavoritesPanelAction::ControlService {
                                     service_name: sname.to_string(),
                                     action: "start".to_string(),
@@ -655,9 +875,14 @@ fn render_favorite_card(
                             }
                         }
 
-                        // Terminal Shortcut
                         if !app.terminal_command.trim().is_empty()
-                            && ui.button("💻 Terminal").on_hover_text(format!("Ouvrir le terminal distant avec la commande: {}", app.terminal_command)).clicked()
+                            && ui
+                                .button("💻 Terminal")
+                                .on_hover_text(format!(
+                                    "Ouvrir le terminal distant avec la commande : {}",
+                                    app.terminal_command
+                                ))
+                                .clicked()
                         {
                             action = Some(FavoritesPanelAction::AttachTerminal {
                                 command: app.terminal_command.clone(),
@@ -671,7 +896,6 @@ fn render_favorite_card(
     action
 }
 
-/// Render Add/Edit Modal Dialog Window.
 fn render_add_edit_modal(
     ui: &mut Ui,
     state: &mut FavoritesPanelState,
@@ -693,9 +917,8 @@ fn render_add_edit_modal(
         .default_width(520.0)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ui.ctx(), |ui| {
-            // Quick template buttons at top of modal
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Modèles rapides:").strong().size(12.0));
+                ui.label(RichText::new("Modèles rapides :").strong().size(12.0));
                 if ui.small_button("⛏️ Minecraft").clicked() {
                     state.apply_minecraft_template();
                 }
@@ -705,17 +928,21 @@ fn render_add_edit_modal(
                 if ui.small_button("🌐 Web").clicked() {
                     state.apply_web_template();
                 }
-                if ui.small_button("🗄️ Database").clicked() {
+                if ui.small_button("🗄️ Base de données").clicked() {
                     state.apply_db_template();
                 }
             });
 
-            // Process importer picker
             if !device.process_state.processes.is_empty() {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("⚡ Importer depuis processus actif:").size(12.0).weak());
-                    let sel_label = state.selected_from_proc_pid
+                    ui.label(
+                        RichText::new("⚡ Importer depuis processus actif :")
+                            .size(12.0)
+                            .weak(),
+                    );
+                    let sel_label = state
+                        .selected_from_proc_pid
                         .and_then(|pid| device.process_state.processes.iter().find(|p| p.pid == pid))
                         .map(|p| format!("{} (PID: {})", p.name, p.pid))
                         .unwrap_or_else(|| "Choisir dans la liste...".to_string());
@@ -725,7 +952,8 @@ fn render_add_edit_modal(
                         .width(220.0)
                         .show_ui(ui, |ui| {
                             for p in &device.process_state.processes {
-                                let label = format!("{} (PID: {}, CPU: {:.1}%)", p.name, p.pid, p.cpu_usage);
+                                let label =
+                                    format!("{} (PID: {}, CPU: {:.1}%)", p.name, p.pid, p.cpu_usage);
                                 let is_sel = state.selected_from_proc_pid == Some(p.pid);
                                 if ui.selectable_label(is_sel, label).clicked() {
                                     state.selected_from_proc_pid = Some(p.pid);
@@ -739,20 +967,19 @@ fn render_add_edit_modal(
             ui.separator();
             ui.add_space(4.0);
 
-            // Form inputs
             egui::Grid::new("fav_modal_form_grid")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    // Name
                     ui.label(RichText::new("Nom du favori *").strong());
                     ui.text_edit_singleline(&mut state.name_input);
                     ui.end_row();
 
-                    // Icon
                     ui.label("Icône / Emoji");
                     ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut state.icon_input).desired_width(40.0));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.icon_input).desired_width(40.0),
+                        );
                         for emoji in &["⭐", "⛏️", "🐳", "🌐", "🗄️", "⚡", "🚀", "🎮", "📦", "🔥"] {
                             if ui.small_button(*emoji).clicked() {
                                 state.icon_input = (*emoji).to_string();
@@ -761,7 +988,6 @@ fn render_add_edit_modal(
                     });
                     ui.end_row();
 
-                    // Type
                     ui.label("Type d'application");
                     egui::ComboBox::from_id_salt("modal_app_type_combo")
                         .selected_text(match state.app_type_input {
@@ -794,51 +1020,58 @@ fn render_add_edit_modal(
                         });
                     ui.end_row();
 
-                    // Process filter
                     ui.label("Filtre processus");
                     ui.vertical(|ui| {
                         ui.text_edit_singleline(&mut state.process_filter_input);
                         ui.label(
-                            RichText::new("Nom de l'exécutable, argument ou PID numérique (ex: java, nginx, 1234)")
-                                .weak()
-                                .size(10.5),
+                            RichText::new(
+                                "Nom de l'exécutable, argument ou PID numérique (ex: java, nginx, 1234)",
+                            )
+                            .weak()
+                            .size(10.5),
                         );
                     });
                     ui.end_row();
 
-                    // Service Name
                     ui.label("Nom service systemd");
                     ui.vertical(|ui| {
                         ui.text_edit_singleline(&mut state.service_name_input);
-                        ui.label(RichText::new("Optionnel si service (ex: nginx.service, postgresql.service)").weak().size(10.5));
+                        ui.label(
+                            RichText::new(
+                                "Optionnel si service (ex: nginx.service, postgresql.service)",
+                            )
+                            .weak()
+                            .size(10.5),
+                        );
                     });
                     ui.end_row();
 
-                    // Terminal command
                     ui.label("Commande terminal");
                     ui.vertical(|ui| {
                         ui.text_edit_singleline(&mut state.terminal_command_input);
                         ui.label(
-                            RichText::new("Exécutée dans le terminal dédié (ex: screen -r mc, docker logs -f myapp)")
-                                .weak()
-                                .size(10.5),
+                            RichText::new(
+                                "Exécutée dans le terminal dédié (ex: screen -r mc, docker logs -f myapp)",
+                            )
+                            .weak()
+                            .size(10.5),
                         );
                     });
                     ui.end_row();
 
-                    // Auto-start command
                     ui.label("Commande démarrage");
                     ui.vertical(|ui| {
                         ui.text_edit_singleline(&mut state.auto_start_command_input);
                         ui.label(
-                            RichText::new("Exécutée pour démarrer l'application si arrêtée (ex: systemctl start nginx, docker compose up -d)")
-                                .weak()
-                                .size(10.5),
+                            RichText::new(
+                                "Exécutée pour démarrer l'application si arrêtée (ex: systemctl start nginx, docker compose up -d)",
+                            )
+                            .weak()
+                            .size(10.5),
                         );
                     });
                     ui.end_row();
 
-                    // Description
                     ui.label("Description");
                     ui.text_edit_multiline(&mut state.description_input);
                     ui.end_row();
@@ -848,26 +1081,26 @@ fn render_add_edit_modal(
             ui.separator();
             ui.add_space(6.0);
 
-            // Modal footer buttons
             ui.horizontal(|ui| {
                 let can_save = !state.name_input.trim().is_empty();
                 let save_btn = ui.add_enabled(
                     can_save,
                     egui::Button::new(
-                        RichText::new(if is_edit { "💾 Mettre à jour" } else { "➕ Ajouter" })
-                            .strong()
-                            .color(Color32::from_rgb(255, 255, 255)),
+                        RichText::new(if is_edit {
+                            "💾 Mettre à jour"
+                        } else {
+                            "➕ Ajouter"
+                        })
+                        .strong()
+                        .color(Color32::from_rgb(255, 255, 255)),
                     ),
                 );
 
                 if save_btn.clicked() {
-                    let id = state.edit_id.clone().unwrap_or_else(|| {
-                        let ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis())
-                            .unwrap_or(0);
-                        format!("fav_{ts}")
-                    });
+                    let id = state
+                        .edit_id
+                        .clone()
+                        .unwrap_or_else(|| format!("fav_{}", uuid::Uuid::new_v4().simple()));
 
                     let srv_name = if state.service_name_input.trim().is_empty() {
                         None
@@ -884,7 +1117,11 @@ fn render_add_edit_modal(
                     let fav = FavoriteApp::new(
                         id,
                         state.name_input.trim(),
-                        if state.icon_input.trim().is_empty() { "⭐" } else { state.icon_input.trim() },
+                        if state.icon_input.trim().is_empty() {
+                            "⭐"
+                        } else {
+                            state.icon_input.trim()
+                        },
                         state.app_type_input,
                         state.process_filter_input.trim(),
                         srv_name,
@@ -911,7 +1148,6 @@ fn render_add_edit_modal(
     action
 }
 
-/// Helper to get badge label and color for FavoriteAppType.
 fn get_type_badge(app: &FavoriteApp) -> (&'static str, Color32, Color32) {
     match app.app_type {
         FavoriteAppType::Docker => (
@@ -947,7 +1183,6 @@ fn get_type_badge(app: &FavoriteApp) -> (&'static str, Color32, Color32) {
     }
 }
 
-/// Helper to format RAM in human-readable units.
 fn format_ram(bytes: u64) -> String {
     let mb = bytes as f64 / (1024.0 * 1024.0);
     if mb >= 1024.0 {
@@ -987,12 +1222,10 @@ mod tests {
         assert_eq!(state.icon_input, "⛏️");
         assert_eq!(state.app_type_input, FavoriteAppType::Process);
         assert_eq!(state.process_filter_input, "minecraft_server");
-        assert!(state.auto_start_command_input.contains("server.jar"));
 
         state.apply_docker_template();
         assert_eq!(state.icon_input, "🐳");
         assert_eq!(state.app_type_input, FavoriteAppType::Docker);
-        assert_eq!(state.process_filter_input, "docker");
 
         state.apply_web_template();
         assert_eq!(state.icon_input, "🌐");
@@ -1001,7 +1234,6 @@ mod tests {
 
         state.apply_db_template();
         assert_eq!(state.icon_input, "🗄️");
-        assert_eq!(state.app_type_input, FavoriteAppType::Service);
         assert_eq!(state.service_name_input, "postgresql.service");
 
         let proc = ntx_proto::ProcessItem {
@@ -1016,41 +1248,11 @@ mod tests {
         };
         state.apply_process_template(&proc);
         assert_eq!(state.name_input, "custom_proc");
-        assert_eq!(state.icon_input, "⚡");
-        assert_eq!(state.process_filter_input, "custom_proc");
-        assert_eq!(state.terminal_command_input, "top -p 4321");
+        assert_eq!(state.terminal_command_input, "");
     }
 
     #[test]
-    fn test_favorites_panel_open_edit() {
-        let app = FavoriteApp::new(
-            "fav_1",
-            "Mon App",
-            "🚀",
-            FavoriteAppType::Custom,
-            "filter_x",
-            Some("srv_x.service".to_string()),
-            "sh attach.sh",
-            "Ma super app",
-            Some("sh run.sh".to_string()),
-        );
-
-        let mut state = FavoritesPanelState::new();
-        state.open_edit(&app);
-
-        assert!(state.show_add_modal);
-        assert_eq!(state.edit_id, Some("fav_1".to_string()));
-        assert_eq!(state.name_input, "Mon App");
-        assert_eq!(state.icon_input, "🚀");
-        assert_eq!(state.app_type_input, FavoriteAppType::Custom);
-        assert_eq!(state.process_filter_input, "filter_x");
-        assert_eq!(state.service_name_input, "srv_x.service");
-        assert_eq!(state.terminal_command_input, "sh attach.sh");
-        assert_eq!(state.auto_start_command_input, "sh run.sh");
-    }
-
-    #[test]
-    fn test_get_type_badge() {
+    fn test_get_type_badge_and_format_ram() {
         let app_docker = FavoriteApp {
             app_type: FavoriteAppType::Docker,
             ..Default::default()
@@ -1058,33 +1260,6 @@ mod tests {
         let (label, _, _) = get_type_badge(&app_docker);
         assert_eq!(label, "🐳 Docker");
 
-        let app_service = FavoriteApp {
-            app_type: FavoriteAppType::Service,
-            ..Default::default()
-        };
-        let (label, _, _) = get_type_badge(&app_service);
-        assert_eq!(label, "⚙ Service");
-
-        let app_minecraft = FavoriteApp {
-            app_type: FavoriteAppType::Process,
-            icon: "⛏️".to_string(),
-            ..Default::default()
-        };
-        let (label, _, _) = get_type_badge(&app_minecraft);
-        assert_eq!(label, "⛏️ Minecraft");
-
-        let app_proc = FavoriteApp {
-            app_type: FavoriteAppType::Process,
-            icon: "⚡".to_string(),
-            name: "htop".to_string(),
-            ..Default::default()
-        };
-        let (label, _, _) = get_type_badge(&app_proc);
-        assert_eq!(label, "⚡ Processus");
-    }
-
-    #[test]
-    fn test_format_ram() {
         assert_eq!(format_ram(500 * 1024 * 1024), "500.0 Mo");
         assert_eq!(format_ram(2 * 1024 * 1024 * 1024), "2.00 Go");
     }

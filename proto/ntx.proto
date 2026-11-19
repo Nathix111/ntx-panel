@@ -4,7 +4,8 @@ package ntx;
 // === Services ===
 
 service NtxAgent {
-    // Authentification
+    // Authentification (Challenge-Response)
+    rpc GetAuthChallenge(AuthChallengeRequest) returns (AuthChallengeResponse);
     rpc Authenticate(AuthRequest) returns (AuthResponse);
 
     // Monitoring
@@ -26,15 +27,28 @@ service NtxAgent {
 
 // === Auth ===
 
+message AuthChallengeRequest {
+    string viewer_id = 1;
+}
+
+message AuthChallengeResponse {
+    string challenge_id = 1;
+    bytes nonce = 2;
+    uint64 expires_in_seconds = 3;
+}
+
 message AuthRequest {
-    string psk_hash = 1;  // SHA-256 du PSK
-    string viewer_id = 2; // UUID du viewer
+    string psk_hash = 1;      // Legacy/deprecated, non accepté par le serveur
+    string viewer_id = 2;     // UUID du viewer
+    string challenge_id = 3;  // ID retourné par GetAuthChallenge
+    string response_hmac = 4; // HMAC-SHA256(key = SHA256(psk), msg = nonce || ":" || viewer_id) en hex
 }
 
 message AuthResponse {
     bool success = 1;
     string session_token = 2;
     string error_message = 3;
+    uint64 expires_in_seconds = 4;
 }
 
 // === Monitoring ===
@@ -173,4 +187,3 @@ message ControlServiceResponse {
     bool success = 1;
     string error_message = 2;
 }
-

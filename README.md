@@ -1,59 +1,70 @@
 # NTX Panel
 
-A lightweight, secure, cross-platform remote management and monitoring panel with zero-configuration mDNS discovery, gRPC streaming metrics, remote PTY terminal, and pre-shared key (PSK) authentication.
+Panneau léger et sécurisé de supervision et d'administration de serveurs Linux sur réseau local, avec découverte mDNS zéro-configuration, transport gRPC chiffré TLS (TOFU SHA-256), authentification challenge-response HMAC-SHA256, gestion de processus/services et émulateur terminal VT100 distant.
 
-## NTX Server (Agent Node)
+## Architecture & Sécurité (v0.2.0)
 
-`ntx-server` is a standalone daemon designed to run on remote Linux and Windows nodes (including Raspberry Pi 5 / ARM64 SBCs).
+- **Transport TLS obligatoire** : `ntx-server` génère automatiquement une paire ECDSA P-256 (`server.crt` / `server.key` en `0600`) et expose son empreinte SHA-256 (`AA:BB:...`) dans `/etc/ntx-server/`, en console au premier démarrage et dans les annonces mDNS. `ntx-viewer` vérifie et épingle l'empreinte (TOFU) avec alerte bloquante si le certificat change.
+- **Authentification Challenge-Response** : échange `GetAuthChallenge` + `HMAC-SHA256(SHA-256(PSK), nonce || ":" || viewer_id)` en temps constant, jeton de session temporaire (TTL configurable, 3600s par défaut), protection contre les rejeux et rate-limiting par IP.
+- **Client HTTP/2 multiplexé persistant** : `ntx-viewer` (Windows & Linux) maintient une seule connexion TLS persistante par serveur pour le monitoring temps réel, les actions processus/services et le terminal VT100 (`htop`, `vim`, `screen`, `tmux`, `sudo`, etc.).
 
-### 1-Command Fast Install (Debian, Ubuntu, Arch Linux, ARM64 / Pi 5)
+## NTX Server (Agent Linux)
 
-Run as any user (will elevate with `sudo` if needed):
+`ntx-server` est un démon systemd autonome conçu pour les nœuds Linux `x86_64` et `aarch64` / ARM64 (Debian, Ubuntu, Arch Linux, Fedora, Raspberry Pi OS 64-bit).
 
-```bash
-curl -sSL https://raw.githubusercontent.com/Nath-11/ntx-panel/master/scripts/install.sh | bash
-```
+### Installation rapide en 1 commande
 
-The script automatically:
-1. Detects system architecture (`x86_64` or `aarch64` / ARM64).
-2. Downloads and installs the stripped `ntx-server` binary (~4MB) to `/usr/local/bin/ntx-server`.
-3. Registers, enables, and starts the systemd unit (`ntx-server.service`).
-4. Generates a secure Pre-Shared Key (PSK) and displays it on screen for easy pairing in `ntx-viewer`.
-
-### 1-Command Clean Purge / Uninstall
-
-To stop the service, remove all binaries, and wipe all configuration directories (`/etc/ntx-server`, `~/.config/ntx-server`, `/root/.config/ntx-server`):
+Exécutez en tant qu'utilisateur avec `sudo` ou `root` :
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/Nath-11/ntx-panel/master/scripts/uninstall.sh | bash
+curl -sSL https://raw.githubusercontent.com/Nathix111/ntx-panel/master/scripts/install.sh | bash
 ```
 
-Or using the installed binary directly:
+Le script :
+1. Détecte l'architecture (`x86_64` ou `aarch64`).
+2. Télécharge le binaire `ntx-server` strippé et vérifie son empreinte `SHA256SUMS`.
+3. L'installe dans `/usr/local/bin/ntx-server` et configure l'unité systemd (`ntx-server.service`) avec la configuration dans `/etc/ntx-server/` (`0600`).
+4. Affiche la clé pré-partagée (`PSK`) et l'empreinte TLS SHA-256 à vérifier dans `ntx-viewer`.
+
+### Désinstallation & purge complète
+
+```bash
+curl -sSL https://raw.githubusercontent.com/Nathix111/ntx-panel/master/scripts/uninstall.sh | bash
+```
+
+Ou directement via le binaire installé :
 
 ```bash
 sudo ntx-server uninstall --purge
 ```
 
-### Server Management Commands
+### Commandes de gestion du serveur
 
 ```bash
-# Check service status
+# Vérifier le statut du service
 sudo ntx-server status
-# or
+# ou
 systemctl status ntx-server
 
-# View current configuration and PSK
+# Afficher la configuration, la PSK et l'empreinte TLS SHA-256
 sudo ntx-server config
 
-# Standard uninstall (keeps configs)
+# Désinstallation standard (conserve /etc/ntx-server)
 sudo ntx-server uninstall
 
-# Clean purge uninstall (removes configs and binary)
+# Purge complète (supprime binaire, service et configurations)
 sudo ntx-server uninstall --purge
 ```
 
-## Releases & Pre-built Binaries
+## NTX Viewer (Client Desktop Windows / Linux)
 
-Pre-compiled release tarballs are built automatically via GitHub Actions:
-- `ntx-server-linux-x86_64.tar.gz` (for standard 64-bit x86 servers)
-- `ntx-server-linux-aarch64.tar.gz` (for 64-bit ARM servers, e.g. Raspberry Pi 5)
+```bash
+cargo run --release -p ntx-viewer
+```
+
+## Releases & Binaires précompilés
+
+Les archives Linux sont générées via GitHub Actions :
+- `ntx-server-linux-x86_64.tar.gz` (serveurs x86 64-bit)
+- `ntx-server-linux-aarch64.tar.gz` (serveurs ARM 64-bit, ex: Raspberry Pi 5)
+- `SHA256SUMS` (empreintes d'intégrité des archives)

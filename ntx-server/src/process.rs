@@ -2,9 +2,15 @@ use ntx_proto::ProcessItem;
 use sysinfo::{Pid, ProcessesToUpdate, Signal, System, Users};
 
 pub async fn list_processes() -> Vec<ProcessItem> {
+    tokio::task::spawn_blocking(list_processes_blocking)
+        .await
+        .unwrap_or_default()
+}
+
+fn list_processes_blocking() -> Vec<ProcessItem> {
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::All, true);
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    std::thread::sleep(std::time::Duration::from_millis(200));
     sys.refresh_processes(ProcessesToUpdate::All, true);
 
     let users = Users::new_with_refreshed_list();
@@ -50,6 +56,13 @@ pub async fn list_processes() -> Vec<ProcessItem> {
 }
 
 pub fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
+    if pid == 0 || pid == 1 || pid == std::process::id() {
+        return Err(format!(
+            "Refus de terminer un processus protégé ou l'agent NTX lui-même (PID {})",
+            pid
+        ));
+    }
+
     let mut sys = System::new();
     let sys_pid = Pid::from_u32(pid);
     sys.refresh_processes(ProcessesToUpdate::Some(&[sys_pid]), true);
@@ -73,7 +86,7 @@ pub fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
     };
 
     let success = if let Some(s) = sig {
-        proc.kill_with(s).unwrap_or_else(|| proc.kill())
+        proc.kill_with(s).unwrap_or(false)
     } else {
         proc.kill()
     };
@@ -85,24 +98,45 @@ pub fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
     #[cfg(unix)]
     {
         let sig_num = if signal > 0 { signal } else { 15 };
-        if let Ok(out) = std::process::Command::new("kill")
+        match std::process::Command::new("kill")
             .args([format!("-{}", sig_num), pid.to_string()])
             .output()
         {
-            if out.status.success() {
-                return Ok(());
+            Ok(out) if out.status.success() => return Ok(()),
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                if !err.is_empty() {
+                    return Err(format!("Failed to kill PID {}: {}", pid, err));
+                }
+            }
+            Err(e) => {
+                return Err(format!("Failed to execute kill for PID {}: {}", pid, e));
             }
         }
     }
 
     #[cfg(windows)]
     {
-        if let Ok(out) = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .output()
-        {
-            if out.status.success() {
-                return Ok(());
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string()]);
+        if signal == 9 {
+            cmd.arg("/F");
+        }
+        match cmd.output() {
+            Ok(out) if out.status.success() => return Ok(()),
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let detail = if !stderr.is_empty() { stderr } else { stdout };
+                if !detail.is_empty() {
+                    return Err(format!("Failed to kill PID {}: {}", pid, detail));
+                }
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Failed to execute taskkill for PID {}: {}",
+                    pid, e
+                ));
             }
         }
     }
@@ -130,10 +164,16 @@ mod tests {
 
     #[test]
     fn test_kill_nonexistent_process() {
-        // PID 99999999 is very unlikely to exist
         let result = kill_process(99999999, 15);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn test_kill_protected_pids_rejected() {
+        assert!(kill_process(0, 9).is_err());
+        assert!(kill_process(1, 9).is_err());
+        assert!(kill_process(std::process::id(), 9).is_err());
     }
 
     #[tokio::test]
@@ -173,10 +213,9 @@ mod tests {
         let child_pid = child.id();
         assert!(child_pid > 0);
 
-        // Give OS a moment to register process
         tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
 
-        let kill_result = kill_process(child_pid, 15);
+        let kill_result = kill_process(child_pid, 9);
         assert!(
             kill_result.is_ok(),
             "Killing child process should succeed: {:?}",

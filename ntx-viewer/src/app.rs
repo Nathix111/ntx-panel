@@ -1,7 +1,10 @@
-use crate::client::NtxClient;
+use crate::client::{ClientConnectError, NtxClient};
 use crate::discovery::{start_discovery, DiscoveredDevice, DiscoveryEvent, DiscoveryHandle};
-use crate::state::{AppSettings, ConnectionStatus, Device, ManualDevice};
+use crate::state::{
+    AppSettings, ConnectionStatus, Device, KnownDevice, ManualDevice, TerminalSessionState,
+};
 use crate::ui::device_panel::{self, DevicePanelAction, DevicePanelState, DeviceTab};
+use crate::ui::favorites_panel::FavoritesPanelAction;
 use crate::ui::process_panel::ProcessPanelAction;
 use crate::ui::settings::{self, SettingsAction, SettingsState};
 use crate::ui::sidebar::{self, SidebarAction, SidebarState};
@@ -11,7 +14,7 @@ use ntx_proto::{SystemInfo, SystemMetrics, TerminalInput, TerminalResize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,27 +26,45 @@ pub enum ActiveView {
 pub enum AppEvent {
     Connected {
         device_id: String,
-        system_info: SystemInfo,
-        session_token: String,
+        generation: u64,
+        client: Box<NtxClient>,
+        system_info: Box<SystemInfo>,
+        fingerprint: String,
+    },
+    TlsMismatch {
+        device_id: String,
+        generation: u64,
+        expected: String,
+        actual: String,
     },
     ConnectionFailed {
         device_id: String,
+        generation: u64,
         error: String,
         is_auth_error: bool,
     },
     MetricsReceived {
         device_id: String,
+        generation: u64,
         metrics: SystemMetrics,
+    },
+    TerminalReady {
+        device_id: String,
+        generation: u64,
     },
     TerminalOutput {
         device_id: String,
+        generation: u64,
         data: Vec<u8>,
     },
     TerminalClosed {
         device_id: String,
+        generation: u64,
+        error: Option<String>,
     },
     Disconnected {
         device_id: String,
+        generation: u64,
     },
     ProcessesReceived {
         device_id: String,
@@ -79,45 +100,62 @@ pub enum AppEvent {
 
 pub struct NtxApp {
     rt: Arc<tokio::runtime::Runtime>,
+    egui_ctx: egui::Context,
     active_view: ActiveView,
     selected_device_id: Option<String>,
     device_panel_state: DevicePanelState,
     sidebar_state: SidebarState,
     devices: HashMap<String, Device>,
+    active_clients: HashMap<String, NtxClient>,
+    connection_gens: HashMap<String, u64>,
+    terminal_gens: HashMap<String, u64>,
     settings: AppSettings,
     settings_state: SettingsState,
+    settings_warning: Option<String>,
     discovery_handle: Option<DiscoveryHandle>,
     discovery_rx: mpsc::Receiver<DiscoveryEvent>,
     event_tx: mpsc::Sender<AppEvent>,
     event_rx: mpsc::Receiver<AppEvent>,
     terminal_txs: HashMap<String, mpsc::Sender<TerminalInput>>,
-    metrics_cancel_txs: HashMap<String, tokio::sync::oneshot::Sender<()>>,
+    metrics_cancel_txs: HashMap<String, oneshot::Sender<()>>,
 }
 
 impl NtxApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, rt: Arc<tokio::runtime::Runtime>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, rt: Arc<tokio::runtime::Runtime>) -> Self {
+        let egui_ctx = cc.egui_ctx.clone();
         let (disc_tx, disc_rx) = mpsc::channel(64);
-        let (event_tx, event_rx) = mpsc::channel(128);
+        let (event_tx, event_rx) = mpsc::channel(256);
 
-        let discovery_handle = match start_discovery(disc_tx, rt.handle().clone()) {
-            Ok(handle) => Some(handle),
-            Err(e) => {
-                warn!("Could not start mDNS discovery: {e}");
-                None
-            }
-        };
+        let discovery_handle =
+            match start_discovery(disc_tx, rt.handle().clone(), Some(egui_ctx.clone())) {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    warn!("Impossible de démarrer la découverte mDNS : {e}");
+                    None
+                }
+            };
 
-        let settings = AppSettings::load();
+        let (settings, settings_warning) = AppSettings::load();
+        egui_ctx.set_visuals(if settings.dark_mode {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        });
 
         let mut app = Self {
             rt,
+            egui_ctx,
             active_view: ActiveView::Device,
             selected_device_id: None,
             device_panel_state: DevicePanelState::default(),
             sidebar_state: SidebarState::new(),
             devices: HashMap::new(),
+            active_clients: HashMap::new(),
+            connection_gens: HashMap::new(),
+            terminal_gens: HashMap::new(),
             settings,
             settings_state: SettingsState::default(),
+            settings_warning,
             discovery_handle,
             discovery_rx: disc_rx,
             event_tx,
@@ -126,7 +164,6 @@ impl NtxApp {
             metrics_cancel_txs: HashMap::new(),
         };
 
-        // 1. Load any saved known devices from settings (persisted across restarts)
         for known in &app.settings.known_devices.clone() {
             let mut dev = Device::new(
                 known.id.clone(),
@@ -138,7 +175,16 @@ impl NtxApp {
             dev.psk = known
                 .psk
                 .clone()
-                .or_else(|| app.settings.device_psks.get(&known.id).cloned());
+                .filter(|p| !p.trim().is_empty())
+                .or_else(|| {
+                    app.settings
+                        .device_psks
+                        .get(&known.id)
+                        .filter(|p| !p.trim().is_empty())
+                        .cloned()
+                });
+            dev.cert_fingerprint = known.cert_fingerprint.clone();
+            dev.is_manual = known.is_manual;
             dev.status = ConnectionStatus::Disconnected;
             if let Some(favs) = app.settings.favorite_apps.get(&known.id) {
                 dev.favorites = favs.clone();
@@ -146,36 +192,75 @@ impl NtxApp {
             app.devices.insert(known.id.clone(), dev);
         }
 
-        // 2. Load any saved manual devices from settings
-        for manual in &app.settings.manual_devices.clone() {
-            app.add_manual_device(manual.clone());
-        }
-
-        // 3. Auto-select first device if available
         if !app.devices.is_empty() {
             let first_id = app.devices.keys().next().cloned();
-            if let Some(ref id) = first_id {
-                if let Some(dev) = app.devices.get(id) {
-                    app.device_panel_state.psk_input = dev.psk.clone().unwrap_or_default();
-                }
-            }
-            app.selected_device_id = first_id;
+            app.select_device(first_id);
         }
 
         app
+    }
+
+    fn apply_theme(&self) {
+        self.egui_ctx.set_visuals(if self.settings.dark_mode {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        });
+    }
+
+    fn select_device(&mut self, id: Option<String>) {
+        self.selected_device_id = id.clone();
+        self.device_panel_state.psk_status_message = None;
+        self.device_panel_state.show_delete_confirm = false;
+        self.device_panel_state.favorites_state.show_add_modal = false;
+        self.device_panel_state.favorites_state.pending_confirm = None;
+        self.device_panel_state.favorites_state.reset_form();
+
+        if let Some(ref dev_id) = id {
+            let (psk_val, should_fetch_proc, should_fetch_srv) =
+                if let Some(dev) = self.devices.get(dev_id) {
+                    let on_proc_or_fav = matches!(
+                        self.device_panel_state.active_tab,
+                        DeviceTab::Processes | DeviceTab::Favorites
+                    );
+                    let fetch_proc = on_proc_or_fav
+                        && dev.status.is_connected()
+                        && dev.process_state.processes.is_empty()
+                        && !dev.process_state.is_loading_processes;
+                    let fetch_srv = on_proc_or_fav
+                        && dev.status.is_connected()
+                        && dev.process_state.services.is_empty()
+                        && !dev.process_state.is_loading_services;
+                    (dev.psk.clone().unwrap_or_default(), fetch_proc, fetch_srv)
+                } else {
+                    (String::new(), false, false)
+                };
+
+            self.device_panel_state.psk_input = psk_val;
+            if should_fetch_proc {
+                self.fetch_processes(dev_id);
+            }
+            if should_fetch_srv {
+                self.fetch_services(dev_id);
+            }
+        } else {
+            self.device_panel_state.psk_input.clear();
+        }
     }
 
     fn save_known_devices(&mut self) {
         self.settings.known_devices = self
             .devices
             .values()
-            .map(|d| crate::state::KnownDevice {
+            .map(|d| KnownDevice {
                 id: d.id.clone(),
                 hostname: d.hostname.clone(),
                 addresses: d.addresses.clone(),
                 port: d.port,
                 version: d.version.clone(),
                 psk: d.psk.clone(),
+                cert_fingerprint: d.cert_fingerprint.clone(),
+                is_manual: d.is_manual,
             })
             .collect();
         let _ = self.settings.save();
@@ -193,16 +278,19 @@ impl NtxApp {
             }
         });
 
-        if let Some(id) = existing_id {
+        let target_id = if let Some(id) = existing_id {
             if let Some(dev) = self.devices.get_mut(&id) {
                 dev.hostname = manual.hostname;
-                if manual.psk.is_some() {
-                    dev.psk = manual.psk;
+                if !dev.addresses.contains(&manual.address) {
+                    dev.addresses.insert(0, manual.address);
+                }
+                dev.is_manual = true;
+                if let Some(p) = manual.psk.filter(|s| !s.trim().is_empty()) {
+                    dev.psk = Some(p.clone());
+                    self.settings.device_psks.insert(id.clone(), p);
                 }
             }
-            if self.selected_device_id.is_none() {
-                self.selected_device_id = Some(id);
-            }
+            id
         } else {
             let id = format!("{}:{}", manual.address, manual.port);
             let mut dev = Device::new(
@@ -210,18 +298,36 @@ impl NtxApp {
                 manual.hostname,
                 vec![manual.address],
                 manual.port,
-                "manual".to_string(),
+                "manuel".to_string(),
             );
-            dev.psk = manual.psk;
+            dev.is_manual = true;
+            dev.status = ConnectionStatus::Disconnected;
+            if let Some(p) = manual.psk.filter(|s| !s.trim().is_empty()) {
+                dev.psk = Some(p.clone());
+                self.settings.device_psks.insert(id.clone(), p);
+            }
             if let Some(favs) = self.settings.favorite_apps.get(&id) {
                 dev.favorites = favs.clone();
             }
             self.devices.insert(id.clone(), dev);
-            if self.selected_device_id.is_none() {
-                self.selected_device_id = Some(id);
-            }
-        }
+            id
+        };
+
         self.save_known_devices();
+        self.select_device(Some(target_id));
+    }
+
+    fn remove_device(&mut self, device_id: &str) {
+        self.disconnect_device(device_id);
+        self.devices.remove(device_id);
+        self.settings.device_psks.remove(device_id);
+        self.settings.favorite_apps.remove(device_id);
+        self.save_known_devices();
+
+        if self.selected_device_id.as_deref() == Some(device_id) {
+            let next_id = self.devices.keys().next().cloned();
+            self.select_device(next_id);
+        }
     }
 
     fn restart_discovery(&mut self) {
@@ -231,24 +337,50 @@ impl NtxApp {
 
         let (disc_tx, disc_rx) = mpsc::channel(64);
         self.discovery_rx = disc_rx;
-        match start_discovery(disc_tx, self.rt.handle().clone()) {
+        match start_discovery(
+            disc_tx,
+            self.rt.handle().clone(),
+            Some(self.egui_ctx.clone()),
+        ) {
             Ok(handle) => self.discovery_handle = Some(handle),
-            Err(e) => warn!("Failed to restart discovery: {e}"),
+            Err(e) => warn!("Échec du redémarrage de la découverte mDNS : {e}"),
         }
     }
 
-    fn get_effective_psk(&self, device: &Device) -> String {
-        if let Some(dev_psk) = &device.psk {
-            if !dev_psk.is_empty() {
-                return dev_psk.clone();
-            }
-        }
-        if let Some(saved_psk) = self.settings.device_psks.get(&device.id) {
-            if !saved_psk.is_empty() {
-                return saved_psk.clone();
-            }
-        }
-        self.settings.default_psk.clone()
+    fn resolve_psk(&self, device: &Device) -> Option<String> {
+        device
+            .psk
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.settings
+                    .device_psks
+                    .get(&device.id)
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+            })
+            .or_else(|| {
+                let d = self.settings.default_psk.trim();
+                if d.is_empty() {
+                    None
+                } else {
+                    Some(d)
+                }
+            })
+            .map(|s| s.to_string())
+    }
+
+    fn next_connection_gen(&mut self, device_id: &str) -> u64 {
+        let entry = self.connection_gens.entry(device_id.to_string()).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    fn next_terminal_gen(&mut self, device_id: &str) -> u64 {
+        let entry = self.terminal_gens.entry(device_id.to_string()).or_insert(0);
+        *entry += 1;
+        *entry
     }
 
     fn initiate_connect(&mut self, device_id: &str, explicit_psk: Option<String>) {
@@ -265,35 +397,30 @@ impl NtxApp {
             }
         }
 
-        let (endpoint, psk) = match self.devices.get_mut(device_id) {
-            Some(d) => {
-                let resolved_psk = d
-                    .psk
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .or_else(|| {
-                        self.settings
-                            .device_psks
-                            .get(device_id)
-                            .map(|s| s.as_str())
-                    })
-                    .or_else(|| {
-                        if !self.settings.default_psk.trim().is_empty() {
-                            Some(self.settings.default_psk.as_str())
-                        } else {
-                            None
-                        }
-                    });
+        let Some(resolved_psk) = self.devices.get(device_id).and_then(|d| self.resolve_psk(d))
+        else {
+            if let Some(d) = self.devices.get_mut(device_id) {
+                d.status = ConnectionStatus::AuthFailed(
+                    "Veuillez renseigner une clé PSK dans les paramètres du serveur ou globaux."
+                        .to_string(),
+                );
+            }
+            return;
+        };
 
-                if let Some(p) = resolved_psk {
-                    let psk_str = p.to_string();
-                    d.status = ConnectionStatus::Connecting;
-                    (d.grpc_endpoint(), psk_str)
-                } else {
-                    d.status =
-                        ConnectionStatus::AuthFailed("Please enter the PSK first".to_string());
-                    return;
-                }
+        let gen = self.next_connection_gen(device_id);
+        let _ = self.next_terminal_gen(device_id);
+        self.active_clients.remove(device_id);
+        self.terminal_txs.remove(device_id);
+        if let Some(old_tx) = self.metrics_cancel_txs.remove(device_id) {
+            let _ = old_tx.send(());
+        }
+
+        let (endpoint, expected_fp) = match self.devices.get_mut(device_id) {
+            Some(d) => {
+                d.status = ConnectionStatus::Connecting;
+                d.terminal_state = TerminalSessionState::Idle;
+                (d.grpc_endpoint(), d.cert_fingerprint.clone())
             }
             None => return,
         };
@@ -301,216 +428,263 @@ impl NtxApp {
         let viewer_id = self.settings.viewer_id.clone();
         let interval_ms = self.settings.refresh_rate_ms;
         let event_tx = self.event_tx.clone();
+        let ctx = self.egui_ctx.clone();
         let dev_id = device_id.to_string();
 
-        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
-        if let Some(old_tx) = self.metrics_cancel_txs.insert(dev_id.clone(), cancel_tx) {
-            let _ = old_tx.send(());
-        }
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        self.metrics_cancel_txs.insert(dev_id.clone(), cancel_tx);
 
+        let rt_handle = self.rt.handle().clone();
         self.rt.spawn(async move {
-            info!("Connecting to device {} at {}", dev_id, endpoint);
-            let mut client = match NtxClient::connect(&endpoint).await {
+            info!("Connexion TLS gRPC vers {} ({})", dev_id, endpoint);
+            let mut client = match NtxClient::connect_and_authenticate(
+                &endpoint,
+                &resolved_psk,
+                &viewer_id,
+                expected_fp,
+            )
+            .await
+            {
                 Ok(c) => c,
-                Err(e) => {
-                    error!("Connection error to {}: {e}", dev_id);
+                Err(ClientConnectError::TlsMismatch { expected, actual }) => {
+                    let _ = event_tx
+                        .send(AppEvent::TlsMismatch {
+                            device_id: dev_id,
+                            generation: gen,
+                            expected,
+                            actual,
+                        })
+                        .await;
+                    ctx.request_repaint();
+                    return;
+                }
+                Err(ClientConnectError::AuthFailed(err)) => {
                     let _ = event_tx
                         .send(AppEvent::ConnectionFailed {
                             device_id: dev_id,
-                            error: format!("Failed to connect: {e}"),
+                            generation: gen,
+                            error: err,
+                            is_auth_error: true,
+                        })
+                        .await;
+                    ctx.request_repaint();
+                    return;
+                }
+                Err(ClientConnectError::RateLimited(err)) => {
+                    let _ = event_tx
+                        .send(AppEvent::ConnectionFailed {
+                            device_id: dev_id,
+                            generation: gen,
+                            error: format!("Trop de tentatives : {err}"),
+                            is_auth_error: true,
+                        })
+                        .await;
+                    ctx.request_repaint();
+                    return;
+                }
+                Err(ClientConnectError::Transport(err)) => {
+                    error!("Erreur de connexion vers {}: {}", dev_id, err);
+                    let _ = event_tx
+                        .send(AppEvent::ConnectionFailed {
+                            device_id: dev_id,
+                            generation: gen,
+                            error: err,
                             is_auth_error: false,
                         })
                         .await;
+                    ctx.request_repaint();
                     return;
                 }
             };
 
-            let session_token = match client.authenticate(&psk, &viewer_id).await {
-                Ok(token) => token,
-                Err(e) => {
-                    let err_str = e.to_string();
-                    let is_auth = err_str.to_lowercase().contains("auth")
-                        || err_str.to_lowercase().contains("psk")
-                        || err_str.to_lowercase().contains("rejected");
-                    let _ = event_tx
-                        .send(AppEvent::ConnectionFailed {
-                            device_id: dev_id,
-                            error: err_str,
-                            is_auth_error: is_auth,
-                        })
-                        .await;
-                    return;
-                }
-            };
-
+            let fingerprint = client.cert_fingerprint().to_string();
             let system_info = match client.get_system_info().await {
                 Ok(info) => info,
                 Err(e) => {
-                    warn!("GetSystemInfo error for {}: {e}", dev_id);
+                    warn!("Erreur GetSystemInfo pour {}: {e}", dev_id);
                     SystemInfo::default()
                 }
             };
 
+            let stream_client = client.clone();
             let _ = event_tx
                 .send(AppEvent::Connected {
                     device_id: dev_id.clone(),
-                    system_info,
-                    session_token,
+                    generation: gen,
+                    client: Box::new(client),
+                    system_info: Box::new(system_info),
+                    fingerprint,
                 })
                 .await;
+            ctx.request_repaint();
 
-            match client.stream_metrics(interval_ms).await {
-                Ok(mut stream) => loop {
-                    tokio::select! {
-                        _ = &mut cancel_rx => {
-                            info!("Metrics streaming cancelled for {}", dev_id);
-                            break;
-                        }
-                        item = stream.message() => {
-                            match item {
-                                Ok(Some(metrics)) => {
-                                    if event_tx.send(AppEvent::MetricsReceived {
-                                        device_id: dev_id.clone(),
-                                        metrics,
-                                    }).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Ok(None) => {
-                                    info!("Metrics stream ended by server for {}", dev_id);
-                                    break;
-                                }
-                                Err(e) => {
-                                    warn!("Metrics stream error for {}: {e}", dev_id);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                },
-                Err(e) => {
-                    warn!("Failed to initiate metrics stream for {}: {e}", dev_id);
-                }
-            }
-
-            let _ = event_tx
-                .send(AppEvent::Disconnected { device_id: dev_id })
-                .await;
+            spawn_metrics_stream_task(
+                rt_handle,
+                stream_client,
+                dev_id,
+                gen,
+                interval_ms,
+                cancel_rx,
+                event_tx,
+                ctx,
+            );
         });
     }
 
+    fn restart_active_metrics_streams(&mut self) {
+        let interval_ms = self.settings.refresh_rate_ms;
+        let connected_ids: Vec<String> = self
+            .active_clients
+            .keys()
+            .filter(|id| {
+                self.devices
+                    .get(*id)
+                    .map(|d| d.status.is_connected())
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+
+        for dev_id in connected_ids {
+            if let Some(old_tx) = self.metrics_cancel_txs.remove(&dev_id) {
+                let _ = old_tx.send(());
+            }
+            if let Some(client) = self.active_clients.get(&dev_id).cloned() {
+                let gen = *self.connection_gens.get(&dev_id).unwrap_or(&0);
+                let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+                self.metrics_cancel_txs.insert(dev_id.clone(), cancel_tx);
+                spawn_metrics_stream_task(
+                    self.rt.handle().clone(),
+                    client,
+                    dev_id,
+                    gen,
+                    interval_ms,
+                    cancel_rx,
+                    self.event_tx.clone(),
+                    self.egui_ctx.clone(),
+                );
+            }
+        }
+    }
+
     fn disconnect_device(&mut self, device_id: &str) {
+        let _ = self.next_connection_gen(device_id);
+        let _ = self.next_terminal_gen(device_id);
+
         if let Some(cancel) = self.metrics_cancel_txs.remove(device_id) {
             let _ = cancel.send(());
         }
+        self.active_clients.remove(device_id);
         self.terminal_txs.remove(device_id);
         if let Some(dev) = self.devices.get_mut(device_id) {
             dev.status = ConnectionStatus::Disconnected;
-            dev.session_token = None;
+            dev.terminal_state = TerminalSessionState::Idle;
+            dev.pending_terminal_command = None;
+            dev.process_state.is_loading_processes = false;
+            dev.process_state.is_loading_services = false;
         }
     }
 
     fn open_terminal_session(&mut self, device_id: &str) {
-        if self.terminal_txs.contains_key(device_id) {
+        let Some(mut client) = self.active_clients.get(device_id).cloned() else {
+            if let Some(dev) = self.devices.get_mut(device_id) {
+                dev.terminal_state =
+                    TerminalSessionState::Error("Serveur non connecté.".to_string());
+            }
             return;
-        }
+        };
 
-        let dev = match self.devices.get(device_id) {
-            Some(d) => d,
+        let gen = self.next_terminal_gen(device_id);
+        let (rows, cols) = match self.devices.get_mut(device_id) {
+            Some(d) => {
+                d.terminal_state = TerminalSessionState::Connecting;
+                d.terminal.size()
+            }
             None => return,
         };
 
-        let endpoint = dev.grpc_endpoint();
-        let psk = self.get_effective_psk(dev);
-        let viewer_id = self.settings.viewer_id.clone();
-        let dev_id = device_id.to_string();
-        let event_tx = self.event_tx.clone();
-
-        let (input_tx, input_rx) = mpsc::channel::<TerminalInput>(64);
-        self.terminal_txs.insert(dev_id.clone(), input_tx.clone());
+        let (input_tx, input_rx) = mpsc::channel::<TerminalInput>(128);
+        self.terminal_txs
+            .insert(device_id.to_string(), input_tx.clone());
 
         let _ = input_tx.try_send(TerminalInput {
             input: Some(Input::Resize(TerminalResize {
-                cols: 80,
-                rows: 24,
+                cols: cols as u32,
+                rows: rows as u32,
             })),
         });
 
+        let dev_id = device_id.to_string();
+        let event_tx = self.event_tx.clone();
+        let ctx = self.egui_ctx.clone();
+
         self.rt.spawn(async move {
-            let mut client = match NtxClient::connect(&endpoint).await {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = event_tx
-                        .send(AppEvent::TerminalOutput {
-                            device_id: dev_id.clone(),
-                            data: format!("Failed to connect to terminal: {e}\r\n").into_bytes(),
-                        })
-                        .await;
-                    let _ = event_tx
-                        .send(AppEvent::TerminalClosed { device_id: dev_id })
-                        .await;
-                    return;
-                }
-            };
-
-            if let Err(e) = client.authenticate(&psk, &viewer_id).await {
-                let _ = event_tx
-                    .send(AppEvent::TerminalOutput {
-                        device_id: dev_id.clone(),
-                        data: format!("Terminal authentication failed: {e}\r\n").into_bytes(),
-                    })
-                    .await;
-                let _ = event_tx
-                    .send(AppEvent::TerminalClosed { device_id: dev_id })
-                    .await;
-                return;
-            }
-
             let mut out_stream = match client.open_terminal(input_rx).await {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = event_tx
-                        .send(AppEvent::TerminalOutput {
-                            device_id: dev_id.clone(),
-                            data: format!("Failed to open terminal stream: {e}\r\n").into_bytes(),
+                        .send(AppEvent::TerminalClosed {
+                            device_id: dev_id,
+                            generation: gen,
+                            error: Some(format!("Impossible d'ouvrir le terminal : {e}")),
                         })
                         .await;
-                    let _ = event_tx
-                        .send(AppEvent::TerminalClosed { device_id: dev_id })
-                        .await;
+                    ctx.request_repaint();
                     return;
                 }
             };
 
-            while let Ok(Some(output)) = out_stream.message().await {
-                if !output.data.is_empty()
-                    && event_tx
-                        .send(AppEvent::TerminalOutput {
-                            device_id: dev_id.clone(),
-                            data: output.data,
-                        })
-                        .await
-                        .is_err()
-                {
-                    break;
+            let _ = event_tx
+                .send(AppEvent::TerminalReady {
+                    device_id: dev_id.clone(),
+                    generation: gen,
+                })
+                .await;
+            ctx.request_repaint();
+
+            let mut closed_err = None;
+            loop {
+                match out_stream.message().await {
+                    Ok(Some(output)) => {
+                        if !output.data.is_empty() {
+                            if event_tx
+                                .send(AppEvent::TerminalOutput {
+                                    device_id: dev_id.clone(),
+                                    generation: gen,
+                                    data: output.data,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            ctx.request_repaint();
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        closed_err = Some(e.to_string());
+                        break;
+                    }
                 }
             }
 
             let _ = event_tx
-                .send(AppEvent::TerminalClosed { device_id: dev_id })
+                .send(AppEvent::TerminalClosed {
+                    device_id: dev_id,
+                    generation: gen,
+                    error: closed_err,
+                })
                 .await;
+            ctx.request_repaint();
         });
     }
 
-    fn get_client_credentials(&self, device_id: &str) -> Option<(String, String, String)> {
-        let dev = self.devices.get(device_id)?;
-        let endpoint = dev.grpc_endpoint();
-        let psk = self.get_effective_psk(dev);
-        let viewer_id = self.settings.viewer_id.clone();
-        Some((endpoint, psk, viewer_id))
-    }
-
     fn fetch_processes(&mut self, device_id: &str) {
+        let Some(mut client) = self.active_clients.get(device_id).cloned() else {
+            return;
+        };
+
         if let Some(dev) = self.devices.get_mut(device_id) {
             if dev.process_state.is_loading_processes {
                 return;
@@ -519,38 +693,11 @@ impl NtxApp {
             dev.process_state.last_process_refresh = Some(std::time::Instant::now());
         }
 
-        let (endpoint, psk, viewer_id) = match self.get_client_credentials(device_id) {
-            Some(c) => c,
-            None => return,
-        };
-
         let dev_id = device_id.to_string();
         let event_tx = self.event_tx.clone();
+        let ctx = self.egui_ctx.clone();
 
         self.rt.spawn(async move {
-            let mut client = match NtxClient::connect(&endpoint).await {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = event_tx
-                        .send(AppEvent::ProcessesFailed {
-                            device_id: dev_id,
-                            error: format!("Failed to connect: {e}"),
-                        })
-                        .await;
-                    return;
-                }
-            };
-
-            if let Err(e) = client.authenticate(&psk, &viewer_id).await {
-                let _ = event_tx
-                    .send(AppEvent::ProcessesFailed {
-                        device_id: dev_id,
-                        error: format!("Authentication failed: {e}"),
-                    })
-                    .await;
-                return;
-            }
-
             match client.list_processes().await {
                 Ok(processes) => {
                     let _ = event_tx
@@ -564,15 +711,20 @@ impl NtxApp {
                     let _ = event_tx
                         .send(AppEvent::ProcessesFailed {
                             device_id: dev_id,
-                            error: format!("ListProcesses failed: {e:#}"),
+                            error: format!("{e:#}"),
                         })
                         .await;
                 }
             }
+            ctx.request_repaint();
         });
     }
 
     fn fetch_services(&mut self, device_id: &str) {
+        let Some(mut client) = self.active_clients.get(device_id).cloned() else {
+            return;
+        };
+
         if let Some(dev) = self.devices.get_mut(device_id) {
             if dev.process_state.is_loading_services {
                 return;
@@ -581,38 +733,11 @@ impl NtxApp {
             dev.process_state.last_service_refresh = Some(std::time::Instant::now());
         }
 
-        let (endpoint, psk, viewer_id) = match self.get_client_credentials(device_id) {
-            Some(c) => c,
-            None => return,
-        };
-
         let dev_id = device_id.to_string();
         let event_tx = self.event_tx.clone();
+        let ctx = self.egui_ctx.clone();
 
         self.rt.spawn(async move {
-            let mut client = match NtxClient::connect(&endpoint).await {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = event_tx
-                        .send(AppEvent::ServicesFailed {
-                            device_id: dev_id,
-                            error: format!("Failed to connect: {e}"),
-                        })
-                        .await;
-                    return;
-                }
-            };
-
-            if let Err(e) = client.authenticate(&psk, &viewer_id).await {
-                let _ = event_tx
-                    .send(AppEvent::ServicesFailed {
-                        device_id: dev_id,
-                        error: format!("Authentication failed: {e}"),
-                    })
-                    .await;
-                return;
-            }
-
             match client.list_services().await {
                 Ok(services) => {
                     let _ = event_tx
@@ -626,53 +751,29 @@ impl NtxApp {
                     let _ = event_tx
                         .send(AppEvent::ServicesFailed {
                             device_id: dev_id,
-                            error: format!("ListServices failed: {e:#}"),
+                            error: format!("{e:#}"),
                         })
                         .await;
                 }
             }
+            ctx.request_repaint();
         });
     }
 
     fn kill_process(&mut self, device_id: &str, pid: u32, signal: i32) {
-        let (endpoint, psk, viewer_id) = match self.get_client_credentials(device_id) {
-            Some(c) => c,
-            None => return,
+        let Some(mut client) = self.active_clients.get(device_id).cloned() else {
+            if let Some(dev) = self.devices.get_mut(device_id) {
+                dev.process_state
+                    .set_status("Serveur non connecté.", true);
+            }
+            return;
         };
 
         let dev_id = device_id.to_string();
         let event_tx = self.event_tx.clone();
+        let ctx = self.egui_ctx.clone();
 
         self.rt.spawn(async move {
-            let mut client = match NtxClient::connect(&endpoint).await {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = event_tx
-                        .send(AppEvent::ProcessKilled {
-                            device_id: dev_id,
-                            pid,
-                            signal,
-                            success: false,
-                            error: format!("Failed to connect: {e}"),
-                        })
-                        .await;
-                    return;
-                }
-            };
-
-            if let Err(e) = client.authenticate(&psk, &viewer_id).await {
-                let _ = event_tx
-                    .send(AppEvent::ProcessKilled {
-                        device_id: dev_id,
-                        pid,
-                        signal,
-                        success: false,
-                        error: format!("Authentication failed: {e}"),
-                    })
-                    .await;
-                return;
-            }
-
             match client.kill_process(pid, signal).await {
                 Ok(resp) => {
                     let _ = event_tx
@@ -692,55 +793,31 @@ impl NtxApp {
                             pid,
                             signal,
                             success: false,
-                            error: format!("KillProcess failed: {e:#}"),
+                            error: format!("{e:#}"),
                         })
                         .await;
                 }
             }
+            ctx.request_repaint();
         });
     }
 
     fn control_service(&mut self, device_id: &str, service_name: &str, action: &str) {
-        let (endpoint, psk, viewer_id) = match self.get_client_credentials(device_id) {
-            Some(c) => c,
-            None => return,
+        let Some(mut client) = self.active_clients.get(device_id).cloned() else {
+            if let Some(dev) = self.devices.get_mut(device_id) {
+                dev.process_state
+                    .set_status("Serveur non connecté.", true);
+            }
+            return;
         };
 
         let dev_id = device_id.to_string();
         let s_name = service_name.to_string();
         let act = action.to_string();
         let event_tx = self.event_tx.clone();
+        let ctx = self.egui_ctx.clone();
 
         self.rt.spawn(async move {
-            let mut client = match NtxClient::connect(&endpoint).await {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = event_tx
-                        .send(AppEvent::ServiceControlled {
-                            device_id: dev_id,
-                            service_name: s_name,
-                            action: act,
-                            success: false,
-                            error: format!("Failed to connect: {e}"),
-                        })
-                        .await;
-                    return;
-                }
-            };
-
-            if let Err(e) = client.authenticate(&psk, &viewer_id).await {
-                let _ = event_tx
-                    .send(AppEvent::ServiceControlled {
-                        device_id: dev_id,
-                        service_name: s_name,
-                        action: act,
-                        success: false,
-                        error: format!("Authentication failed: {e}"),
-                    })
-                    .await;
-                return;
-            }
-
             match client.control_service(&s_name, &act).await {
                 Ok(resp) => {
                     let _ = event_tx
@@ -760,16 +837,16 @@ impl NtxApp {
                             service_name: s_name,
                             action: act,
                             success: false,
-                            error: format!("ControlService failed: {e:#}"),
+                            error: format!("{e:#}"),
                         })
                         .await;
                 }
             }
+            ctx.request_repaint();
         });
     }
 
     fn poll_channels(&mut self) {
-        // Poll discovery
         while let Ok(event) = self.discovery_rx.try_recv() {
             match event {
                 DiscoveryEvent::Added(DiscoveredDevice {
@@ -778,6 +855,7 @@ impl NtxApp {
                     addresses,
                     port,
                     version,
+                    cert_fingerprint,
                 }) => {
                     let existing_id = self.devices.iter().find_map(|(id, d)| {
                         if id == &fullname {
@@ -787,7 +865,9 @@ impl NtxApp {
                             if d.hostname.eq_ignore_ascii_case(&hostname) {
                                 return Some(id.clone());
                             }
-                            if d.addresses.iter().any(|a| addresses.contains(a)) {
+                            if !addresses.is_empty()
+                                && d.addresses.iter().any(|a| addresses.contains(a))
+                            {
                                 return Some(id.clone());
                             }
                         }
@@ -797,9 +877,14 @@ impl NtxApp {
                     if let Some(id) = existing_id {
                         if let Some(dev) = self.devices.get_mut(&id) {
                             dev.hostname = hostname;
-                            dev.addresses = addresses;
+                            if !addresses.is_empty() {
+                                dev.addresses = addresses;
+                            }
                             dev.port = port;
                             dev.version = version;
+                            if cert_fingerprint.is_some() {
+                                dev.mdns_fingerprint = cert_fingerprint;
+                            }
                             if dev.status == ConnectionStatus::Disconnected {
                                 dev.status = ConnectionStatus::Discovered;
                             }
@@ -807,22 +892,27 @@ impl NtxApp {
                     } else {
                         let id = fullname.clone();
                         let mut dev = Device::new(id.clone(), hostname, addresses, port, version);
+                        dev.mdns_fingerprint = cert_fingerprint;
                         if let Some(saved) = self.settings.device_psks.get(&id) {
-                            dev.psk = Some(saved.clone());
+                            if !saved.trim().is_empty() {
+                                dev.psk = Some(saved.clone());
+                            }
                         }
                         if let Some(favs) = self.settings.favorite_apps.get(&id) {
                             dev.favorites = favs.clone();
                         }
                         self.devices.insert(id.clone(), dev);
                         if self.selected_device_id.is_none() {
-                            self.selected_device_id = Some(id);
+                            self.select_device(Some(id));
                         }
                     }
                     self.save_known_devices();
                 }
                 DiscoveryEvent::Removed(fullname) => {
                     if let Some(dev) = self.devices.get_mut(&fullname) {
-                        if !dev.status.is_connected() {
+                        if !dev.status.is_connected()
+                            && !matches!(dev.status, ConnectionStatus::Connecting)
+                        {
                             dev.status = ConnectionStatus::Disconnected;
                         }
                     }
@@ -830,38 +920,70 @@ impl NtxApp {
             }
         }
 
-        // Poll app events
         let cap = self.settings.history_capacity;
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 AppEvent::Connected {
                     device_id,
+                    generation,
+                    client,
                     system_info,
-                    session_token,
+                    fingerprint,
                 } => {
+                    if self.connection_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    self.active_clients.insert(device_id.clone(), *client);
                     if let Some(dev) = self.devices.get_mut(&device_id) {
                         dev.status = ConnectionStatus::Connected;
-                        dev.session_token = Some(session_token);
-                        dev.system_info = Some(system_info);
+                        dev.system_info = Some(*system_info);
+                        dev.cert_fingerprint = Some(fingerprint);
                         if let Some(ref psk) = dev.psk {
-                            self.settings
-                                .device_psks
-                                .insert(device_id.clone(), psk.clone());
-                            let _ = self.settings.save();
+                            if !psk.trim().is_empty() {
+                                self.settings
+                                    .device_psks
+                                    .insert(device_id.clone(), psk.clone());
+                            }
                         }
                     }
-                    if self.device_panel_state.active_tab == DeviceTab::Processes
-                        || self.device_panel_state.active_tab == DeviceTab::Favorites
+                    self.save_known_devices();
+
+                    if self.selected_device_id.as_deref() == Some(&device_id)
+                        && matches!(
+                            self.device_panel_state.active_tab,
+                            DeviceTab::Processes | DeviceTab::Favorites
+                        )
                     {
                         self.fetch_processes(&device_id);
                         self.fetch_services(&device_id);
                     }
                 }
+                AppEvent::TlsMismatch {
+                    device_id,
+                    generation,
+                    expected,
+                    actual,
+                } => {
+                    if self.connection_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    self.active_clients.remove(&device_id);
+                    self.metrics_cancel_txs.remove(&device_id);
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        dev.status = ConnectionStatus::TlsMismatch { expected, actual };
+                    }
+                }
                 AppEvent::ConnectionFailed {
                     device_id,
+                    generation,
                     error,
                     is_auth_error,
                 } => {
+                    if self.connection_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    self.active_clients.remove(&device_id);
+                    self.metrics_cancel_txs.remove(&device_id);
                     if let Some(dev) = self.devices.get_mut(&device_id) {
                         dev.status = if is_auth_error {
                             ConnectionStatus::AuthFailed(error)
@@ -870,28 +992,102 @@ impl NtxApp {
                         };
                     }
                 }
-                AppEvent::MetricsReceived { device_id, metrics } => {
+                AppEvent::MetricsReceived {
+                    device_id,
+                    generation,
+                    metrics,
+                } => {
+                    if self.connection_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
                     if let Some(dev) = self.devices.get_mut(&device_id) {
                         dev.record_metrics(metrics, cap);
                     }
                 }
-                AppEvent::TerminalOutput { device_id, data } => {
+                AppEvent::TerminalReady {
+                    device_id,
+                    generation,
+                } => {
+                    if self.terminal_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
                     if let Some(dev) = self.devices.get_mut(&device_id) {
-                        dev.terminal.push_bytes(&data);
+                        dev.terminal_state = TerminalSessionState::Open;
+                        if let Some(cmd) = dev.pending_terminal_command.take() {
+                            if !cmd.trim().is_empty() {
+                                if let Some(tx) = self.terminal_txs.get(&device_id) {
+                                    let mut payload = cmd;
+                                    if !payload.ends_with('\n') && !payload.ends_with('\r') {
+                                        payload.push('\r');
+                                    }
+                                    let _ = tx.try_send(TerminalInput {
+                                        input: Some(Input::Data(payload.into_bytes())),
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
-                AppEvent::TerminalClosed { device_id } => {
+                AppEvent::TerminalOutput {
+                    device_id,
+                    generation,
+                    data,
+                } => {
+                    if self.terminal_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        dev.terminal.process_bytes(&data);
+                    }
+                }
+                AppEvent::TerminalClosed {
+                    device_id,
+                    generation,
+                    error,
+                } => {
+                    if self.terminal_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
                     self.terminal_txs.remove(&device_id);
                     if let Some(dev) = self.devices.get_mut(&device_id) {
-                        dev.terminal
-                            .push_str("\r\n[Terminal session disconnected]\r\n");
+                        dev.terminal_state = match error {
+                            Some(err) => {
+                                dev.terminal.write_local_notice(&format!(
+                                    "\r\n\x1b[31m[Erreur terminal : {err}]\x1b[0m\r\n"
+                                ));
+                                TerminalSessionState::Error(err)
+                            }
+                            None => {
+                                dev.terminal.write_local_notice(
+                                    "\r\n\x1b[33m[Session terminal terminée]\x1b[0m\r\n",
+                                );
+                                TerminalSessionState::ClosedByUser
+                            }
+                        };
                     }
                 }
-                AppEvent::Disconnected { device_id } => {
+                AppEvent::Disconnected {
+                    device_id,
+                    generation,
+                } => {
+                    if self.connection_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    self.active_clients.remove(&device_id);
+                    self.terminal_txs.remove(&device_id);
+                    self.metrics_cancel_txs.remove(&device_id);
                     if let Some(dev) = self.devices.get_mut(&device_id) {
                         if dev.status.is_connected() {
                             dev.status = ConnectionStatus::Disconnected;
                         }
+                        if matches!(
+                            dev.terminal_state,
+                            TerminalSessionState::Open | TerminalSessionState::Connecting
+                        ) {
+                            dev.terminal_state = TerminalSessionState::ClosedByUser;
+                        }
+                        dev.process_state.is_loading_processes = false;
+                        dev.process_state.is_loading_services = false;
                     }
                 }
                 AppEvent::ProcessesReceived {
@@ -907,7 +1103,7 @@ impl NtxApp {
                     if let Some(dev) = self.devices.get_mut(&device_id) {
                         dev.process_state.is_loading_processes = false;
                         dev.process_state.set_status(
-                            format!("Erreur lors de la récupération des processus: {error}"),
+                            format!("Erreur lors de la récupération des processus : {error}"),
                             true,
                         );
                     }
@@ -930,7 +1126,7 @@ impl NtxApp {
                             );
                         } else {
                             dev.process_state.set_status(
-                                format!("Échec de l'arrêt du processus PID {pid}: {error}"),
+                                format!("Échec de l'arrêt du processus PID {pid} : {error}"),
                                 true,
                             );
                         }
@@ -950,7 +1146,7 @@ impl NtxApp {
                     if let Some(dev) = self.devices.get_mut(&device_id) {
                         dev.process_state.is_loading_services = false;
                         dev.process_state.set_status(
-                            format!("Erreur lors de la récupération des services: {error}"),
+                            format!("Erreur lors de la récupération des services : {error}"),
                             true,
                         );
                     }
@@ -965,92 +1161,179 @@ impl NtxApp {
                     if let Some(dev) = self.devices.get_mut(&device_id) {
                         if success {
                             dev.process_state.set_status(
-                                format!("Action '{action}' appliquée avec succès sur {service_name}."),
+                                format!("Action « {action} » appliquée avec succès sur {service_name}."),
                                 false,
                             );
                         } else {
                             dev.process_state.set_status(
-                                format!("Échec de l'action '{action}' sur {service_name}: {error}"),
+                                format!("Échec de l'action « {action} » sur {service_name} : {error}"),
                                 true,
                             );
                         }
                     }
                     self.fetch_services(&device_id);
+                    self.fetch_processes(&device_id);
                 }
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn spawn_metrics_stream_task(
+    rt_handle: tokio::runtime::Handle,
+    mut client: NtxClient,
+    dev_id: String,
+    gen: u64,
+    interval_ms: u32,
+    mut cancel_rx: oneshot::Receiver<()>,
+    event_tx: mpsc::Sender<AppEvent>,
+    ctx: egui::Context,
+) {
+    rt_handle.spawn(async move {
+        let mut was_cancelled = false;
+
+        match client.stream_metrics(interval_ms).await {
+            Ok(mut stream) => loop {
+                tokio::select! {
+                    _ = &mut cancel_rx => {
+                        info!("Streaming de métriques annulé pour {}", dev_id);
+                        was_cancelled = true;
+                        break;
+                    }
+                    item = stream.message() => {
+                        match item {
+                            Ok(Some(metrics)) => {
+                                if event_tx.send(AppEvent::MetricsReceived {
+                                    device_id: dev_id.clone(),
+                                    generation: gen,
+                                    metrics,
+                                }).await.is_err() {
+                                    was_cancelled = true;
+                                    break;
+                                }
+                                ctx.request_repaint();
+                            }
+                            Ok(None) => {
+                                info!("Flux de métriques fermé par le serveur pour {}", dev_id);
+                                break;
+                            }
+                            Err(e) => {
+                                warn!("Erreur sur le flux de métriques pour {} : {}", dev_id, e);
+                                break;
+                            }
+                        }
+                    }
+                }
+            },
+            Err(e) => {
+                warn!("Impossible de démarrer le flux de métriques pour {} : {}", dev_id, e);
+            }
+        }
+
+        if !was_cancelled {
+            let _ = event_tx
+                .send(AppEvent::Disconnected {
+                    device_id: dev_id,
+                    generation: gen,
+                })
+                .await;
+            ctx.request_repaint();
+        }
+    });
+}
+
 impl eframe::App for NtxApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_channels();
 
-        // Auto-refresh processes if enabled
-        if let Some(ref id) = self.selected_device_id {
-            if self.device_panel_state.active_tab == DeviceTab::Processes {
-                if let Some(dev) = self.devices.get(id) {
-                    if dev.status.is_connected()
-                        && dev.process_state.auto_refresh
-                        && !dev.process_state.is_paused
-                        && !dev.process_state.is_loading_processes
-                    {
-                        let should_refresh = dev
-                            .process_state
-                            .last_process_refresh
-                            .map(|t| {
-                                t.elapsed()
-                                    >= Duration::from_secs(
-                                        dev.process_state.auto_refresh_interval_secs,
-                                    )
-                            })
-                            .unwrap_or(true);
-                        if should_refresh {
-                            let id_clone = id.clone();
-                            self.fetch_processes(&id_clone);
+        // Auto-refresh processes or favorites on selected connected device
+        let mut need_periodic_repaint = self
+            .devices
+            .values()
+            .any(|d| matches!(d.status, ConnectionStatus::Connecting));
+
+        if let Some(ref id) = self.selected_device_id.clone() {
+            if let Some(dev) = self.devices.get(id) {
+                if dev.status.is_connected() {
+                    match self.device_panel_state.active_tab {
+                        DeviceTab::Processes => {
+                            if dev.process_state.auto_refresh && !dev.process_state.is_paused {
+                                need_periodic_repaint = true;
+                                if !dev.process_state.is_loading_processes {
+                                    let should_refresh = dev
+                                        .process_state
+                                        .last_process_refresh
+                                        .map(|t| {
+                                            t.elapsed()
+                                                >= Duration::from_secs(
+                                                    dev.process_state.auto_refresh_interval_secs,
+                                                )
+                                        })
+                                        .unwrap_or(true);
+                                    if should_refresh {
+                                        self.fetch_processes(id);
+                                    }
+                                }
+                            }
                         }
+                        DeviceTab::Favorites => {
+                            need_periodic_repaint = true;
+                            let should_proc = !dev.process_state.is_loading_processes
+                                && dev
+                                    .process_state
+                                    .last_process_refresh
+                                    .map(|t| t.elapsed() >= Duration::from_secs(5))
+                                    .unwrap_or(true);
+                            let should_srv = !dev.process_state.is_loading_services
+                                && dev
+                                    .process_state
+                                    .last_service_refresh
+                                    .map(|t| t.elapsed() >= Duration::from_secs(5))
+                                    .unwrap_or(true);
+                            if should_proc {
+                                self.fetch_processes(id);
+                            }
+                            if should_srv {
+                                self.fetch_services(id);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
         }
 
-        // Repaint periodically for live charts and terminal
-        ctx.request_repaint_after(Duration::from_millis(100));
+        if need_periodic_repaint {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
 
-        // 1. Left Sidebar: Connections & Servers list
+        // 1. Left Sidebar (zero cloning of Device!)
         egui::SidePanel::left("server_sidebar")
             .resizable(true)
             .default_width(260.0)
             .min_width(200.0)
             .max_width(380.0)
             .show(ctx, |ui| {
-                let devices_vec: Vec<Device> = {
-                    let mut v: Vec<Device> = self.devices.values().cloned().collect();
-                    // Sort: connected first, then alphabetical by hostname
-                    v.sort_by(|a, b| {
-                        let a_conn = a.status.is_connected();
-                        let b_conn = b.status.is_connected();
-                        b_conn.cmp(&a_conn).then_with(|| {
-                            a.hostname.to_lowercase().cmp(&b.hostname.to_lowercase())
-                        })
-                    });
-                    v
-                };
+                let mut device_refs: Vec<&Device> = self.devices.values().collect();
+                device_refs.sort_by(|a, b| {
+                    let a_conn = a.status.is_connected();
+                    let b_conn = b.status.is_connected();
+                    b_conn.cmp(&a_conn).then_with(|| {
+                        a.hostname.to_lowercase().cmp(&b.hostname.to_lowercase())
+                    })
+                });
 
                 if let Some(action) = sidebar::render(
                     ui,
                     &mut self.sidebar_state,
-                    &devices_vec,
+                    &device_refs,
                     self.selected_device_id.as_deref(),
                 ) {
                     match action {
                         SidebarAction::SelectDevice(id) => {
-                            self.selected_device_id = Some(id.clone());
                             self.active_view = ActiveView::Device;
-                            if let Some(dev) = self.devices.get(&id) {
-                                self.device_panel_state.psk_input =
-                                    dev.psk.clone().unwrap_or_default();
-                            }
+                            self.select_device(Some(id));
                         }
                         SidebarAction::ConnectDevice(id) => {
                             self.initiate_connect(&id, None);
@@ -1059,20 +1342,9 @@ impl eframe::App for NtxApp {
                             self.disconnect_device(&id);
                         }
                         SidebarAction::RemoveDevice(id) => {
-                            self.disconnect_device(&id);
-                            self.devices.remove(&id);
-                            self.settings.device_psks.remove(&id);
-                            self.settings
-                                .manual_devices
-                                .retain(|m| format!("{}:{}", m.address, m.port) != id);
-                            self.save_known_devices();
-                            if self.selected_device_id.as_deref() == Some(&id) {
-                                self.selected_device_id = self.devices.keys().next().cloned();
-                            }
+                            self.remove_device(&id);
                         }
                         SidebarAction::AddManualDevice(manual) => {
-                            self.settings.manual_devices.push(manual.clone());
-                            let _ = self.settings.save();
                             self.add_manual_device(manual);
                         }
                         SidebarAction::RefreshDiscovery => {
@@ -1085,28 +1357,41 @@ impl eframe::App for NtxApp {
                 }
             });
 
-        // 2. Central Panel: Device Management (with top tabs) or Settings
+        // 2. Central Panel
         egui::CentralPanel::default().show(ctx, |ui| match self.active_view {
             ActiveView::GlobalSettings => {
-                if let Some(action) =
-                    settings::render(ui, &mut self.settings, &mut self.settings_state)
-                {
+                if let Some(action) = settings::render(
+                    ui,
+                    &mut self.settings,
+                    &mut self.settings_state,
+                    self.settings_warning.as_deref(),
+                ) {
                     match action {
-                        SettingsAction::BackToDashboard => {
+                        SettingsAction::BackToPanel => {
                             self.active_view = ActiveView::Device;
                         }
-                        SettingsAction::Saved => {}
+                        SettingsAction::ThemeChanged => {
+                            self.apply_theme();
+                            let _ = self.settings.save();
+                        }
+                        SettingsAction::Saved => {
+                            self.apply_theme();
+                            self.restart_active_metrics_streams();
+                        }
                     }
                 }
             }
             ActiveView::Device => {
                 if let Some(id) = self.selected_device_id.clone() {
-                    // Check if we need to auto-open terminal session before mutable borrow of devices
+                    // Auto-open terminal ONLY when TerminalSessionState::Idle (prevents infinite reopen loop!)
                     let should_open_term = self.device_panel_state.active_tab == DeviceTab::Terminal
                         && self
                             .devices
                             .get(&id)
-                            .map(|d| d.status.is_connected())
+                            .map(|d| {
+                                d.status.is_connected()
+                                    && d.terminal_state == TerminalSessionState::Idle
+                            })
                             .unwrap_or(false)
                         && !self.terminal_txs.contains_key(&id);
 
@@ -1114,10 +1399,20 @@ impl eframe::App for NtxApp {
                         self.open_terminal_session(&id);
                     }
 
+                    let refresh_rate_ms = self.settings.refresh_rate_ms;
+                    let history_capacity = self.settings.history_capacity;
+
                     let action = if let Some(dev) = self.devices.get_mut(&id) {
-                        device_panel::render(ui, &mut self.device_panel_state, dev)
+                        device_panel::render(
+                            ui,
+                            &mut self.device_panel_state,
+                            dev,
+                            refresh_rate_ms,
+                            history_capacity,
+                        )
                     } else {
-                        self.selected_device_id = self.devices.keys().next().cloned();
+                        let next = self.devices.keys().next().cloned();
+                        self.select_device(next);
                         None
                     };
 
@@ -1134,20 +1429,38 @@ impl eframe::App for NtxApp {
                                 self.initiate_connect(&dev_id, None);
                             }
                             DevicePanelAction::Remove(dev_id) => {
-                                self.disconnect_device(&dev_id);
-                                self.devices.remove(&dev_id);
-                                self.settings.device_psks.remove(&dev_id);
-                                self.settings
-                                    .manual_devices
-                                    .retain(|m| format!("{}:{}", m.address, m.port) != dev_id);
-                                self.save_known_devices();
-                                self.selected_device_id = self.devices.keys().next().cloned();
+                                self.remove_device(&dev_id);
                             }
                             DevicePanelAction::SavePsk { id: dev_id, psk } => {
+                                let trimmed = psk.trim().to_string();
                                 if let Some(d) = self.devices.get_mut(&dev_id) {
-                                    d.psk = Some(psk.clone());
+                                    d.psk = if trimmed.is_empty() {
+                                        None
+                                    } else {
+                                        Some(trimmed.clone())
+                                    };
                                 }
-                                self.settings.device_psks.insert(dev_id, psk);
+                                if trimmed.is_empty() {
+                                    self.settings.device_psks.remove(&dev_id);
+                                } else {
+                                    self.settings.device_psks.insert(dev_id, trimmed);
+                                }
+                                self.save_known_devices();
+                            }
+                            DevicePanelAction::TrustNewFingerprint {
+                                id: dev_id,
+                                fingerprint,
+                            } => {
+                                if let Some(d) = self.devices.get_mut(&dev_id) {
+                                    d.cert_fingerprint = Some(fingerprint);
+                                }
+                                self.save_known_devices();
+                                self.initiate_connect(&dev_id, None);
+                            }
+                            DevicePanelAction::ResetFingerprint(dev_id) => {
+                                if let Some(d) = self.devices.get_mut(&dev_id) {
+                                    d.cert_fingerprint = None;
+                                }
                                 self.save_known_devices();
                             }
                             DevicePanelAction::SwitchTab(tab) => {
@@ -1173,132 +1486,170 @@ impl eframe::App for NtxApp {
                                         self.fetch_services(&id);
                                     }
                                 }
-                                if tab == DeviceTab::Terminal {
-                                    // Terminal will be auto-opened on next frame
-                                }
                             }
-                            DevicePanelAction::ProcessAction(proc_action) => {
-                                match proc_action {
-                                    ProcessPanelAction::RefreshProcesses => {
-                                        self.fetch_processes(&id);
-                                    }
-                                    ProcessPanelAction::RefreshServices => {
-                                        self.fetch_services(&id);
-                                    }
-                                    ProcessPanelAction::KillProcess { pid, signal } => {
-                                        self.kill_process(&id, pid, signal);
-                                    }
-                                    ProcessPanelAction::ControlService {
-                                        service_name,
-                                        action,
-                                    } => {
-                                        self.control_service(&id, &service_name, &action);
-                                    }
-                                    ProcessPanelAction::AddFavoriteFromProcess(proc_item) => {
-                                        let ts = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .map(|d| d.as_millis())
-                                            .unwrap_or(0);
-                                        let fav_id = format!("fav_{}_{ts}", proc_item.pid);
-                                        let term_cmd = if !proc_item.command_line.is_empty() {
-                                            format!("top -p {}", proc_item.pid)
-                                        } else {
-                                            String::new()
-                                        };
-                                        let fav = crate::state::FavoriteApp::new(
-                                            fav_id,
-                                            proc_item.name.clone(),
-                                            "⚡",
-                                            crate::state::FavoriteAppType::Process,
-                                            proc_item.name.clone(),
-                                            None,
-                                            term_cmd,
-                                            format!("Processus {} (PID: {})", proc_item.name, proc_item.pid),
-                                            None,
-                                        );
+                            DevicePanelAction::ProcessAction(proc_action) => match proc_action {
+                                ProcessPanelAction::RefreshProcesses => {
+                                    self.fetch_processes(&id);
+                                }
+                                ProcessPanelAction::RefreshServices => {
+                                    self.fetch_services(&id);
+                                }
+                                ProcessPanelAction::KillProcess { pid, signal } => {
+                                    self.kill_process(&id, pid, signal);
+                                }
+                                ProcessPanelAction::ControlService {
+                                    service_name,
+                                    action,
+                                } => {
+                                    self.control_service(&id, &service_name, &action);
+                                }
+                                ProcessPanelAction::AddFavoriteFromProcess(proc_item) => {
+                                    let fav = crate::state::FavoriteApp::new(
+                                        format!("fav_{}", uuid::Uuid::new_v4().simple()),
+                                        proc_item.name.clone(),
+                                        "⚡",
+                                        crate::state::FavoriteAppType::Process,
+                                        proc_item.name.clone(),
+                                        None,
+                                        String::new(),
+                                        format!("Processus {}", proc_item.name),
+                                        None,
+                                    );
 
-                                        if let Some(dev) = self.devices.get_mut(&id) {
-                                            if !dev.favorites.iter().any(|f| f.process_filter == fav.process_filter) {
-                                                dev.favorites.push(fav);
-                                                self.settings.favorite_apps.insert(id.clone(), dev.favorites.clone());
-                                                let _ = self.settings.save();
-                                            }
+                                    if let Some(dev) = self.devices.get_mut(&id) {
+                                        if !dev
+                                            .favorites
+                                            .iter()
+                                            .any(|f| f.process_filter == fav.process_filter)
+                                        {
+                                            dev.favorites.push(fav);
+                                            self.settings
+                                                .favorite_apps
+                                                .insert(id.clone(), dev.favorites.clone());
+                                            let _ = self.settings.save();
                                         }
-                                        self.device_panel_state.active_tab = DeviceTab::Favorites;
+                                    }
+                                    self.device_panel_state.active_tab = DeviceTab::Favorites;
+                                }
+                            },
+                            DevicePanelAction::FavoritesAction(fav_action) => match fav_action {
+                                FavoritesPanelAction::Refresh => {
+                                    self.fetch_processes(&id);
+                                    self.fetch_services(&id);
+                                }
+                                FavoritesPanelAction::ClearStatus => {
+                                    if let Some(dev) = self.devices.get_mut(&id) {
+                                        dev.process_state.clear_status();
                                     }
                                 }
-                            }
-                            DevicePanelAction::FavoritesAction(fav_action) => {
-                                match fav_action {
-                                    crate::ui::favorites_panel::FavoritesPanelAction::AttachTerminal { command } => {
-                                        self.device_panel_state.active_tab = DeviceTab::Terminal;
-                                        if !self.terminal_txs.contains_key(&id) {
-                                            self.open_terminal_session(&id);
-                                        }
+                                FavoritesPanelAction::AttachTerminal { command } => {
+                                    self.device_panel_state.active_tab = DeviceTab::Terminal;
+                                    let is_open = self
+                                        .devices
+                                        .get(&id)
+                                        .map(|d| d.terminal_state == TerminalSessionState::Open)
+                                        .unwrap_or(false);
+
+                                    if is_open {
                                         if !command.trim().is_empty() {
                                             if let Some(tx) = self.terminal_txs.get(&id) {
                                                 let mut cmd = command.clone();
                                                 if !cmd.ends_with('\n') && !cmd.ends_with('\r') {
-                                                    cmd.push('\n');
+                                                    cmd.push('\r');
                                                 }
                                                 let _ = tx.try_send(TerminalInput {
                                                     input: Some(Input::Data(cmd.into_bytes())),
                                                 });
                                             }
                                         }
-                                    }
-                                    crate::ui::favorites_panel::FavoritesPanelAction::KillProcess { pid, signal } => {
-                                        self.kill_process(&id, pid, signal);
-                                    }
-                                    crate::ui::favorites_panel::FavoritesPanelAction::ControlService {
-                                        service_name,
-                                        action,
-                                    } => {
-                                        self.control_service(&id, &service_name, &action);
-                                    }
-                                    crate::ui::favorites_panel::FavoritesPanelAction::SaveFavorite(fav) => {
+                                    } else {
                                         if let Some(dev) = self.devices.get_mut(&id) {
-                                            if let Some(pos) = dev.favorites.iter().position(|f| f.id == fav.id) {
-                                                dev.favorites[pos] = fav;
-                                            } else {
-                                                dev.favorites.push(fav);
-                                            }
-                                            self.settings.favorite_apps.insert(id.clone(), dev.favorites.clone());
-                                            let _ = self.settings.save();
+                                            dev.pending_terminal_command = Some(command);
                                         }
-                                    }
-                                    crate::ui::favorites_panel::FavoritesPanelAction::RemoveFavorite(fav_id) => {
-                                        if let Some(dev) = self.devices.get_mut(&id) {
-                                            dev.favorites.retain(|f| f.id != fav_id);
-                                            self.settings.favorite_apps.insert(id.clone(), dev.favorites.clone());
-                                            let _ = self.settings.save();
+                                        let is_connecting = self
+                                            .devices
+                                            .get(&id)
+                                            .map(|d| {
+                                                d.terminal_state
+                                                    == TerminalSessionState::Connecting
+                                            })
+                                            .unwrap_or(false);
+                                        if !is_connecting {
+                                            self.open_terminal_session(&id);
                                         }
                                     }
                                 }
-                            }
-                            DevicePanelAction::TerminalAction(term_action) => {
-                                match term_action {
-                                    TerminalAction::SendData(data) => {
-                                        if let Some(tx) = self.terminal_txs.get(&id) {
-                                            let _ = tx.try_send(TerminalInput {
-                                                input: Some(Input::Data(data)),
-                                            });
+                                FavoritesPanelAction::KillProcess { pid, signal } => {
+                                    self.kill_process(&id, pid, signal);
+                                }
+                                FavoritesPanelAction::ControlService {
+                                    service_name,
+                                    action,
+                                } => {
+                                    self.control_service(&id, &service_name, &action);
+                                }
+                                FavoritesPanelAction::SaveFavorite(fav) => {
+                                    if let Some(dev) = self.devices.get_mut(&id) {
+                                        if let Some(pos) =
+                                            dev.favorites.iter().position(|f| f.id == fav.id)
+                                        {
+                                            dev.favorites[pos] = fav;
+                                        } else {
+                                            dev.favorites.push(fav);
                                         }
+                                        self.settings
+                                            .favorite_apps
+                                            .insert(id.clone(), dev.favorites.clone());
+                                        let _ = self.settings.save();
                                     }
-                                    TerminalAction::Clear => {}
-                                    TerminalAction::Reconnect => {
-                                        self.terminal_txs.remove(&id);
-                                        if let Some(d) = self.devices.get_mut(&id) {
-                                            d.terminal.clear();
+                                }
+                                FavoritesPanelAction::RemoveFavorite(fav_id) => {
+                                    if let Some(dev) = self.devices.get_mut(&id) {
+                                        dev.favorites.retain(|f| f.id != fav_id);
+                                        self.settings
+                                            .favorite_apps
+                                            .insert(id.clone(), dev.favorites.clone());
+                                        let _ = self.settings.save();
+                                    }
+                                }
+                            },
+                            DevicePanelAction::TerminalActions(term_actions) => {
+                                for term_action in term_actions {
+                                    match term_action {
+                                        TerminalAction::SendData(data) => {
+                                            if let Some(tx) = self.terminal_txs.get(&id) {
+                                                let _ = tx.try_send(TerminalInput {
+                                                    input: Some(Input::Data(data)),
+                                                });
+                                            }
                                         }
-                                        self.open_terminal_session(&id);
+                                        TerminalAction::Resize { cols, rows } => {
+                                            if let Some(tx) = self.terminal_txs.get(&id) {
+                                                let _ = tx.try_send(TerminalInput {
+                                                    input: Some(Input::Resize(TerminalResize {
+                                                        cols: cols as u32,
+                                                        rows: rows as u32,
+                                                    })),
+                                                });
+                                            }
+                                        }
+                                        TerminalAction::Clear => {}
+                                        TerminalAction::Connect => {
+                                            self.open_terminal_session(&id);
+                                        }
+                                        TerminalAction::Reconnect => {
+                                            self.terminal_txs.remove(&id);
+                                            if let Some(d) = self.devices.get_mut(&id) {
+                                                d.terminal.clear();
+                                            }
+                                            self.open_terminal_session(&id);
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 } else {
-                    // Empty state when no device exists or none is selected
                     ui.add_space(40.0);
                     ui.vertical_centered(|ui| {
                         ui.heading("⚡ Bienvenue sur NTX Panel");
@@ -1312,7 +1663,7 @@ impl eframe::App for NtxApp {
                         );
                         ui.add_space(20.0);
                         ui.horizontal(|ui| {
-                            let total_w = 320.0;
+                            let total_w = 340.0;
                             ui.add_space((ui.available_width() - total_w).max(0.0) / 2.0);
 
                             if ui.button("➕ Ajouter un serveur manuellement").clicked() {

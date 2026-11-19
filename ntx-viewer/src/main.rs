@@ -5,12 +5,16 @@ pub mod auth;
 pub mod client;
 pub mod discovery;
 pub mod state;
+pub mod terminal_emu;
+pub mod tls;
 pub mod ui;
 
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 fn main() -> eframe::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()

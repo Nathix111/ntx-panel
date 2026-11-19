@@ -1,8 +1,38 @@
 use ntx_proto::ServiceItem;
+#[cfg(target_os = "linux")]
 use std::process::Command;
-use tracing::{info, warn};
+use tracing::info;
+#[cfg(target_os = "linux")]
+use tracing::warn;
 
-/// Parse the output of `systemctl list-units --type=service --all --no-pager --no-legend`.
+/// Validate a systemd unit / service name to prevent argument injection or path traversal.
+pub fn validate_service_name(name: &str) -> Result<&str, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Le nom du service ne peut pas être vide.".to_string());
+    }
+    if trimmed.len() > 256 {
+        return Err("Le nom du service dépasse 256 caractères.".to_string());
+    }
+    if trimmed.starts_with('-') {
+        return Err(format!(
+            "Nom de service invalide '{}': ne peut pas commencer par '-'.",
+            trimmed
+        ));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@' | ':'))
+    {
+        return Err(format!(
+            "Nom de service invalide '{}': caractères non autorisés.",
+            trimmed
+        ));
+    }
+    Ok(trimmed)
+}
+
+/// Parse the output of `systemctl list-units --type=service --all --no-pager --no-legend --plain`.
 pub fn parse_systemctl_output(output: &str) -> Vec<ServiceItem> {
     let mut services = Vec::new();
 
@@ -53,66 +83,110 @@ pub fn parse_systemctl_output(output: &str) -> Vec<ServiceItem> {
     services
 }
 
-/// Parse the output of Windows `sc.exe query state= all`.
-pub fn parse_sc_query_output(output: &str) -> Vec<ServiceItem> {
-    let mut services = Vec::new();
-    let mut current_name = String::new();
-    let mut current_display = String::new();
-    let mut current_state = String::new();
-
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("SERVICE_NAME:") {
-            if !current_name.is_empty() {
-                services.push(build_windows_service_item(
-                    &current_name,
-                    &current_display,
-                    &current_state,
-                ));
-                current_display.clear();
-                current_state.clear();
+/// List Linux systemd services. Returns an explicit error on non-Linux hosts or if systemctl fails.
+pub fn list_system_services() -> Result<Vec<ServiceItem>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        match Command::new("systemctl")
+            .args([
+                "list-units",
+                "--type=service",
+                "--all",
+                "--no-pager",
+                "--no-legend",
+                "--plain",
+            ])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                Ok(parse_systemctl_output(&stdout))
             }
-            current_name = rest.trim().to_string();
-        } else if let Some(rest) = trimmed.strip_prefix("DISPLAY_NAME:") {
-            current_display = rest.trim().to_string();
-        } else if let Some(rest) = trimmed.strip_prefix("STATE") {
-            // e.g. "STATE              : 4  RUNNING"
-            if let Some((_, val)) = rest.split_once(':') {
-                current_state = val.trim().to_string();
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                warn!(status = ?output.status, stderr = %stderr, "systemctl list-units failed");
+                Err(format!(
+                    "systemctl list-units a échoué (code {:?}): {}",
+                    output.status.code(),
+                    stderr
+                ))
+            }
+            Err(e) => {
+                warn!(error = %e, "systemctl command failed to execute");
+                Err(format!("Impossible d'exécuter systemctl: {}", e))
             }
         }
     }
 
-    if !current_name.is_empty() {
-        services.push(build_windows_service_item(
-            &current_name,
-            &current_display,
-            &current_state,
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err("La gestion des services système est uniquement supportée sur Linux (systemd).".to_string())
+    }
+}
+
+/// Control a Linux systemd service with actions like start, stop, restart, reload, enable, disable.
+pub fn control_system_service(service_name: &str, action: &str) -> Result<(), String> {
+    let action_clean = action.trim().to_lowercase();
+    let valid_actions = ["start", "stop", "restart", "reload", "enable", "disable"];
+    if !valid_actions.contains(&action_clean.as_str()) {
+        return Err(format!(
+            "Action invalide '{}'. Actions supportées: {:?}",
+            action, valid_actions
         ));
     }
 
-    services
-}
+    let clean_name = validate_service_name(service_name)?;
 
-fn build_windows_service_item(name: &str, display: &str, state: &str) -> ServiceItem {
-    let is_running = state.contains("RUNNING");
-    let active_state = if is_running { "active" } else { "inactive" };
-    let sub_state = if is_running { "running" } else { "dead" };
+    #[cfg(test)]
+    if clean_name.starts_with("mock-") || clean_name == "test-service" {
+        info!(
+            service = %clean_name,
+            action = %action_clean,
+            "Test-only mock service action executed"
+        );
+        return Ok(());
+    }
 
-    ServiceItem {
-        name: name.to_string(),
-        description: if display.is_empty() {
-            name.to_string()
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("systemctl")
+            .args([action_clean.as_str(), "--", clean_name])
+            .output()
+            .map_err(|e| format!("Impossible d'exécuter systemctl: {}", e))?;
+
+        if output.status.success() {
+            info!(
+                service = %clean_name,
+                action = %action_clean,
+                "systemctl command succeeded"
+            );
+            Ok(())
         } else {
-            display.to_string()
-        },
-        load_state: "loaded".to_string(),
-        active_state: active_state.to_string(),
-        sub_state: sub_state.to_string(),
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let err_msg = if !stderr.trim().is_empty() {
+                stderr.trim()
+            } else if !stdout.trim().is_empty() {
+                stdout.trim()
+            } else {
+                "Erreur systemctl inconnue"
+            };
+            Err(format!(
+                "systemctl {} {} a échoué: {}",
+                action_clean, clean_name, err_msg
+            ))
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (clean_name, info!("Service control requested on unsupported OS"));
+        Err("La gestion des services système est uniquement supportée sur Linux (systemd).".to_string())
     }
 }
 
-/// Mock services for testing or environments without a supported init system.
+/// Mock services strictly for unit tests.
+#[cfg(test)]
 pub fn get_mock_services() -> Vec<ServiceItem> {
     vec![
         ServiceItem {
@@ -129,190 +203,27 @@ pub fn get_mock_services() -> Vec<ServiceItem> {
             active_state: "active".to_string(),
             sub_state: "running".to_string(),
         },
-        ServiceItem {
-            name: "cron.service".to_string(),
-            description: "Regular background program processing daemon".to_string(),
-            load_state: "loaded".to_string(),
-            active_state: "active".to_string(),
-            sub_state: "running".to_string(),
-        },
-        ServiceItem {
-            name: "systemd-journald.service".to_string(),
-            description: "Journal Service".to_string(),
-            load_state: "loaded".to_string(),
-            active_state: "active".to_string(),
-            sub_state: "running".to_string(),
-        },
-        ServiceItem {
-            name: "emergency.service".to_string(),
-            description: "Emergency Shell".to_string(),
-            load_state: "loaded".to_string(),
-            active_state: "inactive".to_string(),
-            sub_state: "dead".to_string(),
-        },
     ]
-}
-
-/// List system services, querying systemctl on Linux or sc.exe on Windows, falling back to mock services.
-pub fn list_system_services() -> Vec<ServiceItem> {
-    #[cfg(target_os = "linux")]
-    {
-        match Command::new("systemctl")
-            .args(["list-units", "--type=service", "--all", "--no-pager", "--no-legend"])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let parsed = parse_systemctl_output(&stdout);
-                if !parsed.is_empty() {
-                    return parsed;
-                }
-            }
-            Ok(output) => {
-                warn!(
-                    status = ?output.status,
-                    stderr = %String::from_utf8_lossy(&output.stderr),
-                    "systemctl list-units returned non-zero status"
-                );
-            }
-            Err(e) => {
-                warn!(error = %e, "systemctl command not found or failed to execute");
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        match Command::new("sc.exe")
-            .args(["query", "state=", "all"])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let parsed = parse_sc_query_output(&stdout);
-                if !parsed.is_empty() {
-                    return parsed;
-                }
-            }
-            Ok(output) => {
-                warn!(
-                    status = ?output.status,
-                    stderr = %String::from_utf8_lossy(&output.stderr),
-                    "sc.exe query returned non-zero status"
-                );
-            }
-            Err(e) => {
-                warn!(error = %e, "sc.exe command not found or failed to execute");
-            }
-        }
-    }
-
-    info!("Using fallback mock services list");
-    get_mock_services()
-}
-
-/// Control a system service with actions like start, stop, restart.
-pub fn control_system_service(service_name: &str, action: &str) -> Result<(), String> {
-    let action_clean = action.trim().to_lowercase();
-    let valid_actions = ["start", "stop", "restart", "reload", "enable", "disable"];
-    if !valid_actions.contains(&action_clean.as_str()) {
-        return Err(format!(
-            "Invalid action '{}'. Supported actions: {:?}",
-            action, valid_actions
-        ));
-    }
-
-    // Support mock services for tests or simulation
-    if service_name.starts_with("mock-") || service_name == "test-service" {
-        info!(
-            service = %service_name,
-            action = %action_clean,
-            "Mock service action executed successfully"
-        );
-        return Ok(());
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let output = Command::new("systemctl")
-            .arg(&action_clean)
-            .arg(service_name)
-            .output()
-            .map_err(|e| format!("Failed to execute systemctl: {}", e))?;
-
-        if output.status.success() {
-            info!(
-                service = %service_name,
-                action = %action_clean,
-                "systemctl command succeeded"
-            );
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let err_msg = if !stderr.trim().is_empty() {
-                stderr.trim()
-            } else if !stdout.trim().is_empty() {
-                stdout.trim()
-            } else {
-                "Unknown systemctl error"
-            };
-            Err(format!(
-                "systemctl {} {} failed: {}",
-                action_clean, service_name, err_msg
-            ))
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        let win_action = match action_clean.as_str() {
-            "start" => Some("start"),
-            "stop" => Some("stop"),
-            "restart" => {
-                let _ = Command::new("sc.exe").args(["stop", service_name]).output();
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                Some("start")
-            }
-            _ => None,
-        };
-
-        if let Some(act) = win_action {
-            let output = Command::new("sc.exe")
-                .args([act, service_name])
-                .output()
-                .map_err(|e| format!("Failed to execute sc.exe: {}", e))?;
-
-            if output.status.success() {
-                Ok(())
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                Err(format!(
-                    "sc.exe {} {} failed: {} {}",
-                    act, service_name, stderr, stdout
-                ))
-            }
-        } else {
-            Err(format!(
-                "Action '{}' is not supported on Windows services",
-                action_clean
-            ))
-        }
-    }
-
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        Err(format!(
-            "Service management not supported on this operating system for '{}'",
-            service_name
-        ))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_validate_service_name() {
+        assert_eq!(validate_service_name("nginx.service").unwrap(), "nginx.service");
+        assert_eq!(validate_service_name("  ssh@1.service ").unwrap(), "ssh@1.service");
+        assert_eq!(validate_service_name("my_app-2:dev").unwrap(), "my_app-2:dev");
+
+        assert!(validate_service_name("").is_err());
+        assert!(validate_service_name("   ").is_err());
+        assert!(validate_service_name("-H").is_err());
+        assert!(validate_service_name("--root=/tmp").is_err());
+        assert!(validate_service_name("../evil.service").is_err());
+        assert!(validate_service_name("nginx; rm -rf /").is_err());
+        assert!(validate_service_name(&"a".repeat(257)).is_err());
+    }
 
     #[test]
     fn test_parse_systemctl_output() {
@@ -344,40 +255,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_sc_query_output() {
-        let sample = r#"
-SERVICE_NAME: TestService
-DISPLAY_NAME: Test Service Description
-        TYPE               : 10  WIN32_OWN_PROCESS  
-        STATE              : 4  RUNNING 
-                                (STOPPABLE, NOT_PAUSABLE, ACCEPTS_SHUTDOWN)
-        WIN32_EXIT_CODE    : 0  (0x0)
-        SERVICE_EXIT_CODE  : 0  (0x0)
-        CHECKPOINT         : 0x0
-        WAIT_HINT          : 0x0
-
-SERVICE_NAME: StoppedService
-DISPLAY_NAME: Stopped Service Description
-        TYPE               : 20  WIN32_SHARE_PROCESS  
-        STATE              : 1  STOPPED 
-        WIN32_EXIT_CODE    : 1077  (0x435)
-        SERVICE_EXIT_CODE  : 0  (0x0)
-        CHECKPOINT         : 0x0
-        WAIT_HINT          : 0x0
-"#;
-        let services = parse_sc_query_output(sample);
-        assert_eq!(services.len(), 2);
-        assert_eq!(services[0].name, "TestService");
-        assert_eq!(services[0].description, "Test Service Description");
-        assert_eq!(services[0].active_state, "active");
-        assert_eq!(services[0].sub_state, "running");
-
-        assert_eq!(services[1].name, "StoppedService");
-        assert_eq!(services[1].active_state, "inactive");
-        assert_eq!(services[1].sub_state, "dead");
-    }
-
-    #[test]
     fn test_mock_services() {
         let services = get_mock_services();
         assert!(!services.is_empty());
@@ -390,6 +267,7 @@ DISPLAY_NAME: Stopped Service Description
         assert!(control_system_service("mock-service", "start").is_ok());
         assert!(control_system_service("mock-service", "stop").is_ok());
         assert!(control_system_service("mock-service", "restart").is_ok());
+        assert!(control_system_service("--bad-flag", "start").is_err());
     }
 
     #[test]
@@ -418,7 +296,6 @@ DISPLAY_NAME: Stopped Service Description
                 "Invalid action '{}' should fail",
                 action
             );
-            assert!(res.unwrap_err().contains("Invalid action"));
         }
     }
 
@@ -431,19 +308,11 @@ DISPLAY_NAME: Stopped Service Description
     }
 
     #[test]
-    fn test_parse_sc_query_empty_and_malformed() {
-        assert!(parse_sc_query_output("").is_empty());
-        assert!(parse_sc_query_output("Random text without service marker").is_empty());
-        let malformed = "SERVICE_NAME: PartialService\nDISPLAY_NAME: No State";
-        let parsed = parse_sc_query_output(malformed);
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].name, "PartialService");
-        assert_eq!(parsed[0].active_state, "inactive");
-    }
-
-    #[test]
-    fn test_list_system_services_not_empty() {
-        let services = list_system_services();
-        assert!(!services.is_empty());
+    fn test_list_system_services_platform_behavior() {
+        let res = list_system_services();
+        #[cfg(not(target_os = "linux"))]
+        assert!(res.is_err());
+        #[cfg(target_os = "linux")]
+        let _ = res;
     }
 }

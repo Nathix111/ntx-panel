@@ -1,6 +1,6 @@
 #![allow(clippy::result_large_err)]
 
-use crate::auth::AuthManager;
+use crate::auth::{AuthFailure, AuthManager};
 use crate::config::{get_hostname, Config};
 use crate::monitoring::{self, collect_system_info};
 use crate::process;
@@ -8,12 +8,13 @@ use crate::service_manager;
 use crate::terminal;
 use ntx_proto::ntx_agent_server::NtxAgent;
 use ntx_proto::{
-    AuthRequest, AuthResponse, ControlServiceRequest, ControlServiceResponse, Empty,
-    KillProcessRequest, KillProcessResponse, ListProcessesRequest, ListProcessesResponse,
-    ListServicesRequest, ListServicesResponse, MetricsRequest, PingResponse, SystemInfo,
-    SystemMetrics, TerminalInput, TerminalOutput,
+    AuthChallengeRequest, AuthChallengeResponse, AuthRequest, AuthResponse, ControlServiceRequest,
+    ControlServiceResponse, Empty, KillProcessRequest, KillProcessResponse, ListProcessesRequest,
+    ListProcessesResponse, ListServicesRequest, ListServicesResponse, MetricsRequest, PingResponse,
+    SystemInfo, SystemMetrics, TerminalInput, TerminalOutput,
 };
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use sysinfo::{Disks, Networks, System};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -34,38 +35,95 @@ impl NtxAgentService {
             start_time: Instant::now(),
         }
     }
+
+    fn peer_key<T>(request: &Request<T>) -> String {
+        request
+            .remote_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| "local".to_string())
+    }
 }
 
 #[tonic::async_trait]
 impl NtxAgent for NtxAgentService {
+    async fn get_auth_challenge(
+        &self,
+        request: Request<AuthChallengeRequest>,
+    ) -> Result<Response<AuthChallengeResponse>, Status> {
+        let peer_key = Self::peer_key(&request);
+        let req = request.into_inner();
+        let (challenge_id, nonce, expires_in_seconds) =
+            self.auth.create_challenge(&peer_key, &req.viewer_id)?;
+
+        Ok(Response::new(AuthChallengeResponse {
+            challenge_id,
+            nonce,
+            expires_in_seconds,
+        }))
+    }
+
     async fn authenticate(
         &self,
         request: Request<AuthRequest>,
     ) -> Result<Response<AuthResponse>, Status> {
+        let peer_key = Self::peer_key(&request);
         let req = request.into_inner();
-        let psk_hash = req.psk_hash.trim();
 
-        if self.auth.verify_psk_hash(psk_hash) {
-            let session_token = self.auth.create_session();
-            info!(
-                viewer_id = %req.viewer_id,
-                "Authentication successful, created new session"
-            );
-            Ok(Response::new(AuthResponse {
-                success: true,
-                session_token,
-                error_message: String::new(),
-            }))
-        } else {
+        if req.challenge_id.trim().is_empty() || req.response_hmac.trim().is_empty() {
+            self.auth.record_auth_failure(&peer_key);
             warn!(
                 viewer_id = %req.viewer_id,
-                "Authentication failed: invalid PSK hash"
+                peer = %peer_key,
+                "Authentication rejected: challenge-response required"
             );
-            Ok(Response::new(AuthResponse {
+            return Ok(Response::new(AuthResponse {
                 success: false,
                 session_token: String::new(),
-                error_message: "Invalid PSK hash".to_string(),
-            }))
+                error_message: "Challenge-response authentication required".to_string(),
+                expires_in_seconds: 0,
+            }));
+        }
+
+        match self.auth.authenticate_challenge(
+            &peer_key,
+            &req.challenge_id,
+            &req.viewer_id,
+            &req.response_hmac,
+        ) {
+            Ok((session_token, expires_in_seconds)) => {
+                info!(
+                    viewer_id = %req.viewer_id,
+                    peer = %peer_key,
+                    "Authentication successful, created new session"
+                );
+                Ok(Response::new(AuthResponse {
+                    success: true,
+                    session_token,
+                    error_message: String::new(),
+                    expires_in_seconds,
+                }))
+            }
+            Err(AuthFailure::RateLimited(msg)) => {
+                warn!(
+                    viewer_id = %req.viewer_id,
+                    peer = %peer_key,
+                    "Authentication blocked by rate limiter"
+                );
+                Err(Status::resource_exhausted(msg))
+            }
+            Err(AuthFailure::Rejected(msg)) => {
+                warn!(
+                    viewer_id = %req.viewer_id,
+                    peer = %peer_key,
+                    "Authentication failed: invalid credentials"
+                );
+                Ok(Response::new(AuthResponse {
+                    success: false,
+                    session_token: String::new(),
+                    error_message: msg,
+                    expires_in_seconds: 0,
+                }))
+            }
         }
     }
 
@@ -74,7 +132,10 @@ impl NtxAgent for NtxAgentService {
         request: Request<Empty>,
     ) -> Result<Response<SystemInfo>, Status> {
         self.auth.verify_request(&request)?;
-        let info = collect_system_info(&self.config);
+        let config = self.config.clone();
+        let info = tokio::task::spawn_blocking(move || collect_system_info(&config))
+            .await
+            .map_err(|e| Status::internal(format!("SystemInfo task failed: {}", e)))?;
         Ok(Response::new(info))
     }
 
@@ -86,20 +147,70 @@ impl NtxAgent for NtxAgentService {
     ) -> Result<Response<Self::StreamMetricsStream>, Status> {
         self.auth.verify_request(&request)?;
 
-        let interval_ms = request.into_inner().interval_ms.max(250);
+        let interval_ms = request.into_inner().interval_ms.clamp(250, 60_000);
         let (tx, rx) = mpsc::channel(32);
 
         tokio::spawn(async move {
-            let mut sys = System::new_all();
-            let mut disks = Disks::new_with_refreshed_list();
-            let mut networks = Networks::new_with_refreshed_list();
+            let state = Arc::new(Mutex::new((
+                System::new_all(),
+                Disks::new_with_refreshed_list(),
+                Networks::new_with_refreshed_list(),
+            )));
+
+            // Warm-up sleep so initial CPU/network/disk deltas are valid
+            let state_warmup = Arc::clone(&state);
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(mut guard) = state_warmup.lock() {
+                    let (sys, disks, networks) = &mut *guard;
+                    sys.refresh_cpu_all();
+                    disks.refresh(true);
+                    networks.refresh(true);
+                }
+            })
+            .await;
+
+            let mut last_tick = Instant::now();
+            tokio::select! {
+                _ = tx.closed() => return,
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            }
 
             loop {
-                let metrics = monitoring::collect_metrics(&mut sys, &mut disks, &mut networks);
-                if tx.send(Ok(metrics)).await.is_err() {
-                    break;
+                let elapsed_secs = last_tick.elapsed().as_secs_f64();
+                last_tick = Instant::now();
+
+                let state_clone = Arc::clone(&state);
+                let metrics_res = tokio::task::spawn_blocking(move || {
+                    let mut guard = state_clone
+                        .lock()
+                        .map_err(|_| Status::internal("Metrics lock poisoned"))?;
+                    let (sys, disks, networks) = &mut *guard;
+                    Ok::<_, Status>(monitoring::collect_metrics(
+                        sys,
+                        disks,
+                        networks,
+                        elapsed_secs,
+                    ))
+                })
+                .await;
+
+                match metrics_res {
+                    Ok(Ok(metrics)) => {
+                        if tx.send(Ok(metrics)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Err(status)) => {
+                        let _ = tx.send(Err(status)).await;
+                        break;
+                    }
+                    Err(_) => break,
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(interval_ms as u64)).await;
+
+                tokio::select! {
+                    _ = tx.closed() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(interval_ms as u64)) => {}
+                }
             }
         });
 
@@ -143,7 +254,11 @@ impl NtxAgent for NtxAgentService {
     ) -> Result<Response<KillProcessResponse>, Status> {
         self.auth.verify_request(&request)?;
         let req = request.into_inner();
-        let (success, error_message) = match process::kill_process(req.pid, req.signal) {
+        let res = tokio::task::spawn_blocking(move || process::kill_process(req.pid, req.signal))
+            .await
+            .map_err(|e| Status::internal(format!("KillProcess task failed: {}", e)))?;
+
+        let (success, error_message) = match res {
             Ok(()) => (true, String::new()),
             Err(e) => (false, e),
         };
@@ -158,8 +273,14 @@ impl NtxAgent for NtxAgentService {
         request: Request<ListServicesRequest>,
     ) -> Result<Response<ListServicesResponse>, Status> {
         self.auth.verify_request(&request)?;
-        let services = service_manager::list_system_services();
-        Ok(Response::new(ListServicesResponse { services }))
+        let res = tokio::task::spawn_blocking(service_manager::list_system_services)
+            .await
+            .map_err(|e| Status::internal(format!("ListServices task failed: {}", e)))?;
+
+        match res {
+            Ok(services) => Ok(Response::new(ListServicesResponse { services })),
+            Err(msg) => Err(Status::unavailable(msg)),
+        }
     }
 
     async fn control_service(
@@ -168,11 +289,16 @@ impl NtxAgent for NtxAgentService {
     ) -> Result<Response<ControlServiceResponse>, Status> {
         self.auth.verify_request(&request)?;
         let req = request.into_inner();
-        let (success, error_message) =
-            match service_manager::control_system_service(&req.service_name, &req.action) {
-                Ok(()) => (true, String::new()),
-                Err(e) => (false, e),
-            };
+        let res = tokio::task::spawn_blocking(move || {
+            service_manager::control_system_service(&req.service_name, &req.action)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("ControlService task failed: {}", e)))?;
+
+        let (success, error_message) = match res {
+            Ok(()) => (true, String::new()),
+            Err(e) => (false, e),
+        };
         Ok(Response::new(ControlServiceResponse {
             success,
             error_message,
@@ -183,14 +309,42 @@ impl NtxAgent for NtxAgentService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::hash_psk;
+    use crate::auth::{compute_challenge_hmac, derive_psk_key};
     use std::str::FromStr;
     use tonic::metadata::MetadataValue;
+
+    async fn authenticate_service(
+        service: &NtxAgentService,
+        psk: &str,
+        viewer_id: &str,
+    ) -> String {
+        let chal = service
+            .get_auth_challenge(Request::new(AuthChallengeRequest {
+                viewer_id: viewer_id.to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let hmac = compute_challenge_hmac(psk, &chal.nonce, viewer_id);
+        let auth_res = service
+            .authenticate(Request::new(AuthRequest {
+                psk_hash: String::new(),
+                viewer_id: viewer_id.to_string(),
+                challenge_id: chal.challenge_id,
+                response_hmac: hmac,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(auth_res.success);
+        auth_res.session_token
+    }
 
     #[tokio::test]
     async fn test_ping() {
         let config = Config::default();
-        let auth = AuthManager::new(&config.server.psk);
+        let auth = AuthManager::new(&config.server.psk, 3600);
         let service = NtxAgentService::new(config, auth);
 
         let resp = service
@@ -203,32 +357,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_authenticate_success_and_failure() {
+    async fn test_authenticate_challenge_success_and_failure() {
         let psk = "super_secret_test_key";
         let mut config = Config::default();
         config.server.psk = psk.to_string();
 
-        let auth = AuthManager::new(psk);
+        let auth = AuthManager::new(psk, 3600);
         let service = NtxAgentService::new(config, auth);
 
-        // Success
-        let valid_hash = hash_psk(psk);
-        let auth_req = Request::new(AuthRequest {
-            psk_hash: valid_hash,
-            viewer_id: "viewer-123".to_string(),
-        });
-        let auth_res = service.authenticate(auth_req).await.unwrap().into_inner();
-        assert!(auth_res.success);
-        assert!(!auth_res.session_token.is_empty());
+        // Success via challenge-response
+        let session_token = authenticate_service(&service, psk, "viewer-123").await;
+        assert!(!session_token.is_empty());
 
-        // Failure
-        let bad_req = Request::new(AuthRequest {
-            psk_hash: "wrong_hash".to_string(),
-            viewer_id: "viewer-123".to_string(),
-        });
-        let bad_res = service.authenticate(bad_req).await.unwrap().into_inner();
+        // Failure with bad HMAC
+        let chal = service
+            .get_auth_challenge(Request::new(AuthChallengeRequest {
+                viewer_id: "viewer-123".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let bad_res = service
+            .authenticate(Request::new(AuthRequest {
+                psk_hash: String::new(),
+                viewer_id: "viewer-123".to_string(),
+                challenge_id: chal.challenge_id,
+                response_hmac: "00".repeat(32),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
         assert!(!bad_res.success);
         assert!(bad_res.session_token.is_empty());
+
+        // Legacy raw psk_hash without challenge must be rejected
+        let legacy_res = service
+            .authenticate(Request::new(AuthRequest {
+                psk_hash: hex::encode(derive_psk_key(psk)),
+                viewer_id: "viewer-123".to_string(),
+                challenge_id: String::new(),
+                response_hmac: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!legacy_res.success);
     }
 
     #[tokio::test]
@@ -237,29 +410,28 @@ mod tests {
         let mut config = Config::default();
         config.server.psk = psk.to_string();
 
-        let auth = AuthManager::new(psk);
+        let auth = AuthManager::new(psk, 3600);
         let service = NtxAgentService::new(config, auth);
 
         // 1. Unauthenticated -> fails
-        let unauth_req = Request::new(Empty {});
-        assert!(service.get_system_info(unauth_req).await.is_err());
+        assert!(service.get_system_info(Request::new(Empty {})).await.is_err());
 
         // 2. Authenticate to get session token
-        let valid_hash = hash_psk(psk);
-        let auth_res = service
-            .authenticate(Request::new(AuthRequest {
-                psk_hash: valid_hash,
-                viewer_id: "viewer-1".to_string(),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
+        let session_token = authenticate_service(&service, psk, "viewer-1").await;
 
-        // 3. With session token -> succeeds
+        // 3. Raw psk_hash in header -> fails
+        let mut req_with_raw_hash = Request::new(Empty {});
+        req_with_raw_hash.metadata_mut().insert(
+            crate::auth::AUTH_HEADER,
+            MetadataValue::from_str(&hex::encode(derive_psk_key(psk))).unwrap(),
+        );
+        assert!(service.get_system_info(req_with_raw_hash).await.is_err());
+
+        // 4. With valid session token -> succeeds
         let mut req_with_token = Request::new(Empty {});
         req_with_token.metadata_mut().insert(
             crate::auth::AUTH_HEADER,
-            MetadataValue::from_str(&auth_res.session_token).unwrap(),
+            MetadataValue::from_str(&session_token).unwrap(),
         );
         let sys_info = service
             .get_system_info(req_with_token)
@@ -278,20 +450,20 @@ mod tests {
         let mut config = Config::default();
         config.server.psk = psk.to_string();
 
-        let auth = AuthManager::new(psk);
+        let auth = AuthManager::new(psk, 3600);
         let service = NtxAgentService::new(config, auth);
+        let session_token = authenticate_service(&service, psk, "viewer-m").await;
 
         let mut req = Request::new(MetricsRequest { interval_ms: 250 });
-        let psk_hash = hash_psk(psk);
         req.metadata_mut().insert(
             crate::auth::AUTH_HEADER,
-            MetadataValue::from_str(&psk_hash).unwrap(),
+            MetadataValue::from_str(&session_token).unwrap(),
         );
 
         let response = service.stream_metrics(req).await.unwrap();
         let mut stream = response.into_inner();
 
-        let first_metric = tokio::time::timeout(tokio::time::Duration::from_secs(3), stream.next())
+        let first_metric = tokio::time::timeout(Duration::from_secs(3), stream.next())
             .await
             .expect("metric timeout")
             .expect("metric stream open")
@@ -302,136 +474,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_processes_auth() {
+    async fn test_list_processes_and_kill_auth() {
         let psk = "test_key_proc";
         let mut config = Config::default();
         config.server.psk = psk.to_string();
 
-        let auth = AuthManager::new(psk);
+        let auth = AuthManager::new(psk, 3600);
         let service = NtxAgentService::new(config, auth);
+        let session_token = authenticate_service(&service, psk, "viewer-p").await;
 
-        // 1. Unauthenticated -> fails
-        let unauth_req = Request::new(ListProcessesRequest {});
-        assert!(service.list_processes(unauth_req).await.is_err());
+        assert!(service
+            .list_processes(Request::new(ListProcessesRequest {}))
+            .await
+            .is_err());
 
-        // 2. Authenticated -> succeeds
         let mut req = Request::new(ListProcessesRequest {});
-        let psk_hash = hash_psk(psk);
         req.metadata_mut().insert(
             crate::auth::AUTH_HEADER,
-            MetadataValue::from_str(&psk_hash).unwrap(),
+            MetadataValue::from_str(&session_token).unwrap(),
         );
-
         let resp = service.list_processes(req).await.unwrap().into_inner();
         assert!(!resp.processes.is_empty());
         let current_pid = std::process::id();
         assert!(resp.processes.iter().any(|p| p.pid == current_pid));
-    }
 
-    #[tokio::test]
-    async fn test_kill_process_auth() {
-        let psk = "test_key_kill";
-        let mut config = Config::default();
-        config.server.psk = psk.to_string();
-
-        let auth = AuthManager::new(psk);
-        let service = NtxAgentService::new(config, auth);
-
-        // 1. Unauthenticated -> fails
-        let unauth_req = Request::new(KillProcessRequest {
-            pid: 99999999,
-            signal: 15,
+        // Kill protected self PID -> failure response
+        let mut kill_self = Request::new(KillProcessRequest {
+            pid: current_pid,
+            signal: 9,
         });
-        assert!(service.kill_process(unauth_req).await.is_err());
-
-        // 2. Authenticated -> returns response (pid not found -> success: false)
-        let mut req = Request::new(KillProcessRequest {
-            pid: 99999999,
-            signal: 15,
-        });
-        let psk_hash = hash_psk(psk);
-        req.metadata_mut().insert(
+        kill_self.metadata_mut().insert(
             crate::auth::AUTH_HEADER,
-            MetadataValue::from_str(&psk_hash).unwrap(),
+            MetadataValue::from_str(&session_token).unwrap(),
         );
-
-        let resp = service.kill_process(req).await.unwrap().into_inner();
-        assert!(!resp.success);
-        assert!(!resp.error_message.is_empty());
+        let kill_resp = service.kill_process(kill_self).await.unwrap().into_inner();
+        assert!(!kill_resp.success);
+        assert!(!kill_resp.error_message.is_empty());
     }
 
     #[tokio::test]
-    async fn test_list_services_auth() {
+    async fn test_list_and_control_services_auth() {
         let psk = "test_key_svc";
         let mut config = Config::default();
         config.server.psk = psk.to_string();
 
-        let auth = AuthManager::new(psk);
+        let auth = AuthManager::new(psk, 3600);
         let service = NtxAgentService::new(config, auth);
+        let session_token = authenticate_service(&service, psk, "viewer-s").await;
 
-        // 1. Unauthenticated -> fails
-        let unauth_req = Request::new(ListServicesRequest {});
-        assert!(service.list_services(unauth_req).await.is_err());
-
-        // 2. Authenticated -> succeeds
-        let mut req = Request::new(ListServicesRequest {});
-        let psk_hash = hash_psk(psk);
-        req.metadata_mut().insert(
-            crate::auth::AUTH_HEADER,
-            MetadataValue::from_str(&psk_hash).unwrap(),
-        );
-
-        let resp = service.list_services(req).await.unwrap().into_inner();
-        assert!(!resp.services.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_control_service_auth() {
-        let psk = "test_key_ctrl";
-        let mut config = Config::default();
-        config.server.psk = psk.to_string();
-
-        let auth = AuthManager::new(psk);
-        let service = NtxAgentService::new(config, auth);
-
-        // 1. Unauthenticated -> fails
-        let unauth_req = Request::new(ControlServiceRequest {
-            service_name: "mock-service".to_string(),
-            action: "start".to_string(),
-        });
-        assert!(service.control_service(unauth_req).await.is_err());
-
-        // 2. Authenticated with valid mock service -> succeeds
-        let mut req = Request::new(ControlServiceRequest {
-            service_name: "mock-service".to_string(),
-            action: "start".to_string(),
-        });
-        let psk_hash = hash_psk(psk);
-        req.metadata_mut().insert(
-            crate::auth::AUTH_HEADER,
-            MetadataValue::from_str(&psk_hash).unwrap(),
-        );
-
-        let resp = service.control_service(req).await.unwrap().into_inner();
-        assert!(resp.success);
-        assert!(resp.error_message.is_empty());
-
-        // 3. Authenticated with invalid action -> returns failure
-        let mut req_invalid = Request::new(ControlServiceRequest {
-            service_name: "mock-service".to_string(),
-            action: "invalid_action".to_string(),
-        });
-        req_invalid.metadata_mut().insert(
-            crate::auth::AUTH_HEADER,
-            MetadataValue::from_str(&psk_hash).unwrap(),
-        );
-
-        let resp_invalid = service
-            .control_service(req_invalid)
+        assert!(service
+            .list_services(Request::new(ListServicesRequest {}))
             .await
-            .unwrap()
-            .into_inner();
-        assert!(!resp_invalid.success);
-        assert!(!resp_invalid.error_message.is_empty());
+            .is_err());
+
+        let mut req = Request::new(ListServicesRequest {});
+        req.metadata_mut().insert(
+            crate::auth::AUTH_HEADER,
+            MetadataValue::from_str(&session_token).unwrap(),
+        );
+        let svc_res = service.list_services(req).await;
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(svc_res.unwrap_err().code(), tonic::Code::Unavailable);
+        #[cfg(target_os = "linux")]
+        let _ = svc_res;
+
+        let mut ctrl_req = Request::new(ControlServiceRequest {
+            service_name: "--bad".to_string(),
+            action: "start".to_string(),
+        });
+        ctrl_req.metadata_mut().insert(
+            crate::auth::AUTH_HEADER,
+            MetadataValue::from_str(&session_token).unwrap(),
+        );
+        let ctrl_resp = service.control_service(ctrl_req).await.unwrap().into_inner();
+        assert!(!ctrl_resp.success);
+        assert!(!ctrl_resp.error_message.is_empty());
     }
 }

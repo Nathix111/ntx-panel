@@ -44,7 +44,7 @@ impl SidebarState {
 pub fn render(
     ui: &mut Ui,
     state: &mut SidebarState,
-    devices: &[Device],
+    devices: &[&Device],
     selected_id: Option<&str>,
 ) -> Option<SidebarAction> {
     let mut action = None;
@@ -90,12 +90,16 @@ pub fn render(
     let query = state.search_query.trim().to_lowercase();
     let filtered_devices: Vec<&Device> = devices
         .iter()
+        .copied()
         .filter(|d| {
             if query.is_empty() {
                 true
             } else {
                 d.hostname.to_lowercase().contains(&query)
-                    || d.primary_address().contains(&query)
+                    || d.primary_address().to_lowercase().contains(&query)
+                    || d.addresses
+                        .iter()
+                        .any(|a| a.to_lowercase().contains(&query))
                     || d.version.to_lowercase().contains(&query)
             }
         })
@@ -136,24 +140,14 @@ pub fn render(
                 for dev in filtered_devices {
                     let is_selected = selected_id == Some(&dev.id);
 
-                    // Colors & status
-                    let (dot_color, _status_tip) = match &dev.status {
-                        ConnectionStatus::Connected => (Color32::from_rgb(46, 204, 113), "Connecté"),
-                        ConnectionStatus::Connecting => {
-                            (Color32::from_rgb(52, 152, 219), "Connexion en cours...")
-                        }
-                        ConnectionStatus::AuthFailed(_) => {
-                            (Color32::from_rgb(231, 76, 60), "Erreur d'authentification")
-                        }
-                        ConnectionStatus::Error(_) => {
-                            (Color32::from_rgb(230, 126, 34), "Erreur de connexion")
-                        }
-                        ConnectionStatus::Disconnected => {
-                            (Color32::from_rgb(120, 120, 130), "Déconnecté")
-                        }
-                        ConnectionStatus::Discovered => {
-                            (Color32::from_rgb(241, 196, 15), "Découvert")
-                        }
+                    let dot_color = match &dev.status {
+                        ConnectionStatus::Connected => Color32::from_rgb(46, 204, 113),
+                        ConnectionStatus::Connecting => Color32::from_rgb(52, 152, 219),
+                        ConnectionStatus::AuthFailed(_) => Color32::from_rgb(231, 76, 60),
+                        ConnectionStatus::TlsMismatch { .. } => Color32::from_rgb(231, 76, 60),
+                        ConnectionStatus::Error(_) => Color32::from_rgb(230, 126, 34),
+                        ConnectionStatus::Disconnected => Color32::from_rgb(120, 120, 130),
+                        ConnectionStatus::Discovered => Color32::from_rgb(241, 196, 15),
                     };
 
                     let os_icon = if let Some(info) = &dev.system_info {
@@ -163,6 +157,8 @@ pub fn render(
                         } else if os.contains("raspbian")
                             || os.contains("debian")
                             || os.contains("ubuntu")
+                            || os.contains("arch")
+                            || os.contains("linux")
                         {
                             "🐧"
                         } else if os.contains("mac") || os.contains("darwin") {
@@ -188,7 +184,10 @@ pub fn render(
 
                     let frame = egui::Frame::new()
                         .fill(bg_color)
-                        .stroke(Stroke::new(if is_selected { 1.5_f32 } else { 1.0_f32 }, border_color))
+                        .stroke(Stroke::new(
+                            if is_selected { 1.5_f32 } else { 1.0_f32 },
+                            border_color,
+                        ))
                         .corner_radius(6.0)
                         .inner_margin(egui::Margin::symmetric(10, 7));
 
@@ -196,29 +195,23 @@ pub fn render(
                         ui.set_width(ui.available_width());
 
                         ui.horizontal(|ui| {
-                            // Status Dot
                             let (dot_rect, _) =
                                 ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
                             ui.painter().circle_filled(dot_rect.center(), 4.5, dot_color);
 
                             ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(format!("{} {}", os_icon, dev.hostname))
-                                            .strong()
-                                            .size(13.5),
-                                    );
-                                });
+                                ui.label(
+                                    RichText::new(format!("{} {}", os_icon, dev.hostname))
+                                        .strong()
+                                        .size(13.5),
+                                );
 
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(format!("{}:{}", dev.primary_address(), dev.port))
-                                            .size(11.0)
-                                            .color(Color32::from_rgb(150, 155, 165)),
-                                    );
-                                });
+                                ui.label(
+                                    RichText::new(format!("{}:{}", dev.primary_address(), dev.port))
+                                        .size(11.0)
+                                        .color(Color32::from_rgb(150, 155, 165)),
+                                );
 
-                                // Live CPU / RAM stats snippet if connected
                                 if matches!(dev.status, ConnectionStatus::Connected) {
                                     if let Some(metrics) = &dev.latest_metrics {
                                         let cpu = metrics.cpu_usage_percent;
@@ -229,23 +222,26 @@ pub fn render(
                                         } else {
                                             0.0
                                         };
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "CPU {:.0}% • RAM {:.0}%",
-                                                    cpu, ram_pct
-                                                ))
-                                                .size(10.5)
-                                                .color(Color32::from_rgb(46, 204, 113)),
-                                            );
-                                        });
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "CPU {:.0}% • RAM {:.0}%",
+                                                cpu, ram_pct
+                                            ))
+                                            .size(10.5)
+                                            .color(Color32::from_rgb(46, 204, 113)),
+                                        );
                                     }
+                                } else if matches!(dev.status, ConnectionStatus::TlsMismatch { .. }) {
+                                    ui.label(
+                                        RichText::new("⚠ Certificat TLS modifié")
+                                            .size(10.5)
+                                            .color(Color32::from_rgb(231, 76, 60)),
+                                    );
                                 }
                             });
                         });
                     });
 
-                    // Click detection on device card
                     let interact = ui.interact(
                         content_resp.response.rect,
                         ui.make_persistent_id(&dev.id),
@@ -256,7 +252,6 @@ pub fn render(
                         action = Some(SidebarAction::SelectDevice(dev.id.clone()));
                     }
 
-                    // Context Menu (Right Click)
                     let dev_id = dev.id.clone();
                     let is_conn = dev.status.is_connected();
                     interact.context_menu(|ui| {
@@ -265,11 +260,9 @@ pub fn render(
                                 action = Some(SidebarAction::DisconnectDevice(dev_id.clone()));
                                 ui.close_menu();
                             }
-                        } else {
-                            if ui.button("⚡ Connecter").clicked() {
-                                action = Some(SidebarAction::ConnectDevice(dev_id.clone()));
-                                ui.close_menu();
-                            }
+                        } else if ui.button("⚡ Connecter").clicked() {
+                            action = Some(SidebarAction::ConnectDevice(dev_id.clone()));
+                            ui.close_menu();
                         }
 
                         ui.separator();
@@ -312,7 +305,7 @@ pub fn render(
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_width(340.0)
+            .default_width(350.0)
             .show(ui.ctx(), |ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
 
@@ -342,7 +335,7 @@ pub fn render(
                     ui.add(
                         egui::TextEdit::singleline(&mut state.manual_psk)
                             .password(true)
-                            .hint_text("Optionnel si déjà configuré"),
+                            .hint_text("Optionnel si clé par défaut définie"),
                     );
                 });
 
@@ -358,36 +351,51 @@ pub fn render(
                     }
 
                     if ui.button("✅ Enregistrer et Ajouter").clicked() {
-                        let address = state.manual_address.trim().to_string();
+                        let address = state
+                            .manual_address
+                            .trim()
+                            .trim_start_matches('[')
+                            .trim_end_matches(']')
+                            .to_string();
                         if address.is_empty() {
-                            state.add_error = Some("L'adresse IP ne peut pas être vide.".to_string());
+                            state.add_error =
+                                Some("L'adresse IP ou le nom d'hôte ne peut pas être vide.".to_string());
                         } else {
-                            let port = state.manual_port.trim().parse::<u16>().unwrap_or(9850);
-                            let hostname = if state.manual_hostname.trim().is_empty() {
-                                format!("server-{}", port)
-                            } else {
-                                state.manual_hostname.trim().to_string()
-                            };
-                            let psk = if state.manual_psk.trim().is_empty() {
-                                None
-                            } else {
-                                Some(state.manual_psk.trim().to_string())
-                            };
+                            match state.manual_port.trim().parse::<u16>() {
+                                Ok(port) if port > 0 => {
+                                    let hostname = if state.manual_hostname.trim().is_empty() {
+                                        format!("serveur-{}", port)
+                                    } else {
+                                        state.manual_hostname.trim().to_string()
+                                    };
+                                    let psk = if state.manual_psk.trim().is_empty() {
+                                        None
+                                    } else {
+                                        Some(state.manual_psk.trim().to_string())
+                                    };
 
-                            let manual = ManualDevice {
-                                hostname,
-                                address,
-                                port,
-                                psk,
-                            };
+                                    let manual = ManualDevice {
+                                        hostname,
+                                        address,
+                                        port,
+                                        psk,
+                                    };
 
-                            action = Some(SidebarAction::AddManualDevice(manual));
-                            state.show_add_modal = false;
-                            state.manual_hostname.clear();
-                            state.manual_address.clear();
-                            state.manual_psk.clear();
-                            state.manual_port = "9850".to_string();
-                            state.add_error = None;
+                                    action = Some(SidebarAction::AddManualDevice(manual));
+                                    state.show_add_modal = false;
+                                    state.manual_hostname.clear();
+                                    state.manual_address.clear();
+                                    state.manual_psk.clear();
+                                    state.manual_port = "9850".to_string();
+                                    state.add_error = None;
+                                }
+                                _ => {
+                                    state.add_error = Some(
+                                        "Le port doit être un nombre entier entre 1 et 65535."
+                                            .to_string(),
+                                    );
+                                }
+                            }
                         }
                     }
                 });
