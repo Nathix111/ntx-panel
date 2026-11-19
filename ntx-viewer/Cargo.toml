@@ -42,3 +42,6 @@ egui_plot = "0.31"
 
 [dev-dependencies]
 rcgen = { workspace = true }
+
+[lints]
+workspace = true

@@ -55,3 +55,6 @@ vt100 = "0.15"
 
 # UUID
 uuid = { version = "1", features = ["v4"] }
+
+[workspace.lints.clippy]
+result_large_err = "allow"

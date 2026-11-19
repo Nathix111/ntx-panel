@@ -11,3 +11,6 @@ prost-types = { workspace = true }
 [build-dependencies]
 tonic-build = { workspace = true }
 protoc-bin-vendored = "3.3.0"
+
+[lints]
+workspace = true

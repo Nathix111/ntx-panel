@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 pub mod ntx {
     tonic::include_proto!("ntx");
 }
