@@ -29,6 +29,19 @@ pub fn format_fingerprint(fp: &str) -> String {
         .join(":")
 }
 
+fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut cur = err.source();
+    while let Some(cause) = cur {
+        let msg = cause.to_string();
+        if !parts.last().is_some_and(|p| p == &msg) {
+            parts.push(msg);
+        }
+        cur = cause.source();
+    }
+    parts.join(": ")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TlsConnectError {
     #[error("L'empreinte TLS du serveur a changé (attendu: {expected}, reçu: {actual})")]
@@ -198,7 +211,8 @@ pub async fn connect_tls_channel(
             }
             Err(TlsConnectError::Other(format!(
                 "Échec de connexion TLS vers {}: {}",
-                endpoint_url, err
+                endpoint_url,
+                format_error_chain(&err)
             )))
         }
     }

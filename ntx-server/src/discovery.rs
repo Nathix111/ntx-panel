@@ -1,7 +1,8 @@
 use crate::config::{get_hostname, Config};
 use anyhow::{Context, Result};
-use mdns_sd::{ServiceDaemon, ServiceInfo};
+use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use tracing::info;
 
 /// Sanitize a system hostname into a single valid mDNS host label (without `.local.`).
@@ -35,6 +36,9 @@ pub fn start_announcement(config: &Config, cert_fingerprint: &str) -> Result<Opt
     let raw_hostname = get_hostname(config);
     let label = sanitize_mdns_label(&raw_hostname);
     let mdns = ServiceDaemon::new().context("Failed to create mDNS daemon")?;
+    if matches!(config.server.bind_address.trim().parse::<IpAddr>(), Ok(IpAddr::V4(_))) {
+        let _ = mdns.disable_interface(IfKind::IPv6);
+    }
 
     let host_target = format!("{}.local.", label);
     let mut properties = HashMap::new();

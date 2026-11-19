@@ -2335,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "ntx-proto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -2346,7 +2346,7 @@ dependencies = [
 
 [[package]]
 name = "ntx-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2380,7 +2380,7 @@ dependencies = [
 
 [[package]]
 name = "ntx-viewer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -2393,6 +2393,7 @@ dependencies = [
  "mdns-sd",
  "ntx-proto",
  "prost",
+ "raw-window-handle",
  "rcgen",
  "rustls",
  "serde",
@@ -2410,6 +2411,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "vt100",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -9,6 +9,8 @@ pub mod state;
 pub mod terminal_emu;
 pub mod tls;
 pub mod ui;
+#[cfg(target_os = "windows")]
+pub mod win_dpi_fix;
 
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -35,8 +37,8 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0])
-            .with_min_inner_size([800.0, 600.0])
+            .with_inner_size([1160.0, 720.0])
+            .with_min_inner_size([720.0, 520.0])
             .with_title("NTX Panel"),
         ..Default::default()
     };

@@ -905,6 +905,10 @@ pub struct Device {
     pub cert_fingerprint: Option<String>,
     pub mdns_fingerprint: Option<String>,
     pub is_manual: bool,
+    pub auto_connect: bool,
+    pub last_ping_ms: Option<u32>,
+    pub server_uptime_secs: Option<u64>,
+    pub metrics_paused: bool,
     pub system_info: Option<ntx_proto::SystemInfo>,
     pub latest_metrics: Option<ntx_proto::SystemMetrics>,
     pub cpu_history: VecDeque<f64>,
@@ -937,6 +941,10 @@ impl Device {
             cert_fingerprint: None,
             mdns_fingerprint: None,
             is_manual: false,
+            auto_connect: false,
+            last_ping_ms: None,
+            server_uptime_secs: None,
+            metrics_paused: false,
             system_info: None,
             latest_metrics: None,
             cpu_history: VecDeque::with_capacity(120),
@@ -960,16 +968,41 @@ impl Device {
 
     /// Full TLS gRPC endpoint: `https://<ip>:<port>` or `https://[<ipv6>]:<port>`.
     pub fn grpc_endpoint(&self) -> String {
-        let addr = self.primary_address();
-        let trimmed = addr.trim().trim_start_matches('[').trim_end_matches(']');
+        Self::format_grpc_url(&self.primary_address(), self.port)
+    }
+
+    fn format_grpc_url(raw_addr: &str, port: u16) -> String {
+        let trimmed = raw_addr.trim().trim_start_matches('[').trim_end_matches(']');
         if let Ok(IpAddr::V6(_)) = trimmed.parse::<IpAddr>() {
-            format!("https://[{}]:{}", trimmed, self.port)
+            format!("https://[{}]:{}", trimmed, port)
         } else {
-            format!("https://{}:{}", trimmed, self.port)
+            format!("https://{}:{}", trimmed, port)
         }
     }
 
+    /// Deduplicated candidate `(address, https://...)` pairs from usable device addresses.
+    pub fn grpc_endpoints(&self) -> Vec<(String, String)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut endpoints = Vec::new();
+        for addr in &self.addresses {
+            if !crate::discovery::is_usable_address(addr) {
+                continue;
+            }
+            let cleaned = crate::discovery::clean_address_str(addr).to_string();
+            if seen.insert(cleaned.to_ascii_lowercase()) {
+                let url = Self::format_grpc_url(&cleaned, self.port);
+                endpoints.push((cleaned, url));
+            }
+        }
+        endpoints
+    }
+
     pub fn record_metrics(&mut self, metrics: ntx_proto::SystemMetrics, capacity: usize) {
+        if self.metrics_paused {
+            self.latest_metrics = Some(metrics);
+            return;
+        }
+
         self.cpu_history.push_back(metrics.cpu_usage_percent);
         while self.cpu_history.len() > capacity {
             self.cpu_history.pop_front();
@@ -1022,6 +1055,7 @@ pub struct KnownDevice {
     pub psk: Option<String>,
     pub cert_fingerprint: Option<String>,
     pub is_manual: bool,
+    pub auto_connect: bool,
 }
 
 /// A manually configured device (input from modal & legacy settings migration).
@@ -1043,6 +1077,9 @@ pub struct AppSettings {
     pub refresh_rate_ms: u32,
     pub history_capacity: usize,
     pub dark_mode: bool,
+    pub terminal_font_size: f32,
+    pub hide_virtual_disks: bool,
+    pub hide_virtual_interfaces: bool,
     pub device_psks: HashMap<String, String>,
     pub manual_devices: Vec<ManualDevice>,
     pub known_devices: Vec<KnownDevice>,
@@ -1059,6 +1096,9 @@ impl Default for AppSettings {
             refresh_rate_ms: 1000,
             history_capacity: 60,
             dark_mode: true,
+            terminal_font_size: 13.0,
+            hide_virtual_disks: true,
+            hide_virtual_interfaces: true,
             device_psks: HashMap::new(),
             manual_devices: Vec::new(),
             known_devices: Vec::new(),
@@ -1068,6 +1108,12 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    pub fn config_path_display() -> String {
+        Self::get_config_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "ntx-viewer-settings.toml".to_string())
+    }
+
     fn get_config_path() -> Option<PathBuf> {
         if let Ok(appdata) = std::env::var("APPDATA") {
             if !appdata.trim().is_empty() {
@@ -1116,6 +1162,7 @@ impl AppSettings {
                                         psk: m.psk,
                                         cert_fingerprint: None,
                                         is_manual: true,
+                                        auto_connect: false,
                                     });
                                 }
                             }
@@ -1228,6 +1275,46 @@ impl AppSettings {
     }
 }
 
+/// Returns `true` if a disk mount / filesystem is a virtual or system-internal mount
+/// typically hidden from user storage views (tmpfs, snap, loop, boot, dev/sys/proc/run).
+pub fn is_virtual_disk(mount_point: &str, filesystem: &str) -> bool {
+    let fs = filesystem.trim().to_ascii_lowercase();
+    if matches!(
+        fs.as_str(),
+        "tmpfs" | "devtmpfs" | "squashfs" | "overlay" | "proc" | "sysfs" | "devpts" | "autofs"
+    ) || fs.starts_with("cgroup")
+        || fs.starts_with("fuse.")
+    {
+        return true;
+    }
+
+    let mp = mount_point.trim();
+    mp == "/boot"
+        || mp.starts_with("/boot/")
+        || mp == "/run"
+        || mp.starts_with("/run/")
+        || mp == "/dev"
+        || mp.starts_with("/dev/")
+        || mp == "/sys"
+        || mp.starts_with("/sys/")
+        || mp == "/proc"
+        || mp.starts_with("/proc/")
+        || mp.starts_with("/snap/")
+}
+
+/// Returns `true` if a network interface is loopback or a local container/bridge virtual interface.
+pub fn is_virtual_interface(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    lower == "lo"
+        || lower == "lo0"
+        || lower.starts_with("docker")
+        || lower.starts_with("veth")
+        || lower.starts_with("br-")
+        || lower.starts_with("virbr")
+        || lower.starts_with("cni")
+        || lower.starts_with("flannel")
+}
+
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
@@ -1286,6 +1373,29 @@ mod tests {
             "0.2.0".to_string(),
         );
         assert_eq!(dev_v6.grpc_endpoint(), "https://[::1]:9850");
+
+        let dev_mixed = Device::new(
+            "mix_id".to_string(),
+            "mix_host".to_string(),
+            vec![
+                "fe80::344b:2fff:fe9a:e777".to_string(),
+                "192.168.1.50".to_string(),
+                "192.168.1.50".to_string(),
+                "fd00::1".to_string(),
+            ],
+            9850,
+            "0.2.0".to_string(),
+        );
+        assert_eq!(
+            dev_mixed.grpc_endpoints(),
+            vec![
+                (
+                    "192.168.1.50".to_string(),
+                    "https://192.168.1.50:9850".to_string()
+                ),
+                ("fd00::1".to_string(), "https://[fd00::1]:9850".to_string()),
+            ]
+        );
 
         let connected = ConnectionStatus::Connected;
         assert!(connected.is_connected());
@@ -1608,5 +1718,24 @@ mod tests {
         let loaded: Settings = toml::from_str(&toml_str).unwrap();
         assert_eq!(loaded.favorite_apps.len(), 1);
         assert_eq!(loaded.favorite_apps.get("dev-1").unwrap()[0].name, "Nginx");
+    }
+
+    #[test]
+    fn test_virtual_disk_and_interface_filters() {
+        assert!(is_virtual_disk("/run/user/1000", "tmpfs"));
+        assert!(is_virtual_disk("/boot/firmware", "vfat"));
+        assert!(is_virtual_disk("/snap/core20/123", "squashfs"));
+        assert!(is_virtual_disk("/var/lib/docker/overlay2/abc", "overlay"));
+        assert!(!is_virtual_disk("/", "ext4"));
+        assert!(!is_virtual_disk("/mnt/nas", "ext4"));
+        assert!(!is_virtual_disk("C:\\", "NTFS"));
+
+        assert!(is_virtual_interface("lo"));
+        assert!(is_virtual_interface("docker0"));
+        assert!(is_virtual_interface("veth8a91b2"));
+        assert!(is_virtual_interface("br-123456"));
+        assert!(!is_virtual_interface("eth0"));
+        assert!(!is_virtual_interface("wlan0"));
+        assert!(!is_virtual_interface("tailscale0"));
     }
 }
