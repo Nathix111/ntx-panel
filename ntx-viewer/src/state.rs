@@ -48,6 +48,203 @@ pub enum TerminalSessionState {
     Error(String),
 }
 
+/// Lifecycle state of a live managed-service or Docker console stream.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ConsoleStreamState {
+    #[default]
+    Idle,
+    Connecting,
+    Streaming,
+    Closed,
+    Error(String),
+}
+
+/// Interactive streaming mode for a Docker container console.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DockerConsoleMode {
+    #[default]
+    Logs,
+    Attach,
+    Shell,
+}
+
+impl DockerConsoleMode {
+    pub fn as_proto_mode(&self) -> &'static str {
+        match self {
+            DockerConsoleMode::Logs => "logs",
+            DockerConsoleMode::Attach => "attach",
+            DockerConsoleMode::Shell => "shell",
+        }
+    }
+
+    pub fn display_label(&self) -> &'static str {
+        match self {
+            DockerConsoleMode::Logs => "📜 Logs",
+            DockerConsoleMode::Attach => "⌨ Attach (stdin)",
+            DockerConsoleMode::Shell => "💻 Shell",
+        }
+    }
+}
+
+/// Runtime state for server-supervised Managed Services and their live PTY console.
+#[derive(Debug)]
+pub struct ManagedServicesState {
+    pub services: Vec<ntx_proto::ManagedServiceStatus>,
+    pub selected_service_id: Option<String>,
+    pub is_loading: bool,
+    pub unsupported_by_server: bool,
+    pub status_message: Option<(String, bool)>,
+    pub last_refresh: Option<Instant>,
+    pub console_state: ConsoleStreamState,
+    pub console_service_id: Option<String>,
+    pub console_buffer: crate::ui::console_widget::ConsoleBuffer,
+}
+
+impl Default for ManagedServicesState {
+    fn default() -> Self {
+        Self {
+            services: Vec::new(),
+            selected_service_id: None,
+            is_loading: false,
+            unsupported_by_server: false,
+            status_message: None,
+            last_refresh: None,
+            console_state: ConsoleStreamState::Idle,
+            console_service_id: None,
+            console_buffer: crate::ui::console_widget::ConsoleBuffer::default(),
+        }
+    }
+}
+
+impl ManagedServicesState {
+    pub fn set_status(&mut self, msg: impl Into<String>, is_error: bool) {
+        self.status_message = Some((msg.into(), is_error));
+    }
+
+    pub fn clear_status(&mut self) {
+        self.status_message = None;
+    }
+
+    pub fn reset_on_disconnect(&mut self) {
+        self.services.clear();
+        self.is_loading = false;
+        self.unsupported_by_server = false;
+        self.console_state = ConsoleStreamState::Idle;
+        self.console_service_id = None;
+    }
+
+    /// Returns `(total, running, stopped, crashed)`.
+    pub fn service_counts(&self) -> (usize, usize, usize, usize) {
+        let total = self.services.len();
+        let mut running = 0;
+        let mut stopped = 0;
+        let mut crashed = 0;
+
+        for svc in &self.services {
+            match svc.state.trim().to_ascii_lowercase().as_str() {
+                "running" | "active" => running += 1,
+                "crashed" | "failed" => crashed += 1,
+                "stopped" | "inactive" | "exited" => stopped += 1,
+                _ => {}
+            }
+        }
+
+        (total, running, stopped, crashed)
+    }
+
+    pub fn selected_service(&self) -> Option<&ntx_proto::ManagedServiceStatus> {
+        let target_id = self.selected_service_id.as_deref()?;
+        self.services
+            .iter()
+            .find(|svc| svc.config.as_ref().is_some_and(|cfg| cfg.id == target_id))
+    }
+}
+
+/// Runtime state for remote Docker containers and their live console stream.
+#[derive(Debug)]
+pub struct DockerState {
+    pub docker_available: bool,
+    pub docker_version: String,
+    pub docker_error: Option<String>,
+    pub include_all: bool,
+    pub containers: Vec<ntx_proto::DockerContainerItem>,
+    pub selected_container_id: Option<String>,
+    pub is_loading: bool,
+    pub unsupported_by_server: bool,
+    pub status_message: Option<(String, bool)>,
+    pub last_refresh: Option<Instant>,
+    pub console_mode: DockerConsoleMode,
+    pub console_state: ConsoleStreamState,
+    pub console_container_id: Option<String>,
+    pub console_buffer: crate::ui::console_widget::ConsoleBuffer,
+}
+
+impl Default for DockerState {
+    fn default() -> Self {
+        Self {
+            docker_available: true,
+            docker_version: String::new(),
+            docker_error: None,
+            include_all: true,
+            containers: Vec::new(),
+            selected_container_id: None,
+            is_loading: false,
+            unsupported_by_server: false,
+            status_message: None,
+            last_refresh: None,
+            console_mode: DockerConsoleMode::Logs,
+            console_state: ConsoleStreamState::Idle,
+            console_container_id: None,
+            console_buffer: crate::ui::console_widget::ConsoleBuffer::default(),
+        }
+    }
+}
+
+impl DockerState {
+    pub fn set_status(&mut self, msg: impl Into<String>, is_error: bool) {
+        self.status_message = Some((msg.into(), is_error));
+    }
+
+    pub fn clear_status(&mut self) {
+        self.status_message = None;
+    }
+
+    pub fn reset_on_disconnect(&mut self) {
+        self.containers.clear();
+        self.docker_available = true;
+        self.docker_version.clear();
+        self.docker_error = None;
+        self.is_loading = false;
+        self.unsupported_by_server = false;
+        self.console_state = ConsoleStreamState::Idle;
+        self.console_container_id = None;
+    }
+
+    /// Returns `(total, running, paused, stopped)`.
+    pub fn container_counts(&self) -> (usize, usize, usize, usize) {
+        let total = self.containers.len();
+        let mut running = 0;
+        let mut paused = 0;
+        let mut stopped = 0;
+
+        for c in &self.containers {
+            match c.state.trim().to_ascii_lowercase().as_str() {
+                "running" => running += 1,
+                "paused" => paused += 1,
+                "exited" | "created" | "dead" | "stopped" => stopped += 1,
+                _ => {}
+            }
+        }
+
+        (total, running, paused, stopped)
+    }
+
+    pub fn selected_container(&self) -> Option<&ntx_proto::DockerContainerItem> {
+        let target_id = self.selected_container_id.as_deref()?;
+        self.containers.iter().find(|c| c.id == target_id)
+    }
+}
+
 /// Column used for sorting the process table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessSortColumn {
@@ -91,6 +288,14 @@ pub enum ProcessViewMode {
     #[default]
     Tree,
     Flat,
+}
+
+/// Display mode for the fleet overview dashboard (enriched cards or compact table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum OverviewViewMode {
+    #[default]
+    Cards,
+    Table,
 }
 
 /// Category filter for processes.
@@ -892,6 +1097,111 @@ impl FavoriteApp {
     }
 }
 
+/// Convert a legacy client-side [`FavoriteApp`] bookmark into a server-supervised
+/// [`ntx_proto::ManagedServiceConfig`] ready for 1-click migration.
+pub fn favorite_app_to_managed_config(fav: &FavoriteApp) -> ntx_proto::ManagedServiceConfig {
+    let raw_id: String = fav
+        .id
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+
+    let raw_name = fav.name.trim();
+    let name: String = if raw_name.is_empty() {
+        "Service migré".to_string()
+    } else {
+        raw_name.chars().take(100).collect()
+    };
+
+    let raw_icon = fav.icon.trim();
+    let icon = if raw_icon.is_empty() {
+        "⭐".to_string()
+    } else {
+        raw_icon.to_string()
+    };
+
+    let description = fav.description.trim().to_string();
+    let mut command = fav
+        .auto_start_command
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    let mut systemd_unit = fav
+        .service_name
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    let mut attach_command = fav.terminal_command.trim().to_string();
+
+    if command.is_empty() && systemd_unit.is_empty() && attach_command.is_empty() {
+        let filter = fav.process_filter.trim();
+        if !filter.is_empty() {
+            match fav.app_type {
+                FavoriteAppType::Service => systemd_unit = filter.to_string(),
+                FavoriteAppType::Docker => {
+                    attach_command = format!("docker logs -f {filter}");
+                }
+                FavoriteAppType::Process | FavoriteAppType::Custom => {
+                    command = filter.to_string();
+                }
+            }
+        }
+    }
+
+    let is_minecraft = name.to_lowercase().contains("minecraft")
+        || command.to_lowercase().contains("server.jar")
+        || fav.process_filter.to_lowercase().contains("minecraft");
+
+    let (stop_command, quick_commands) = if is_minecraft {
+        (
+            "stop".to_string(),
+            vec![
+                "list".to_string(),
+                "save-all".to_string(),
+                "say Bonjour".to_string(),
+                "stop".to_string(),
+            ],
+        )
+    } else {
+        (String::new(), Vec::new())
+    };
+
+    ntx_proto::ManagedServiceConfig {
+        id: raw_id,
+        name,
+        icon,
+        description,
+        command,
+        working_dir: String::new(),
+        stop_command,
+        auto_start: false,
+        auto_restart: false,
+        env_vars: Vec::new(),
+        quick_commands,
+        systemd_unit,
+        attach_command,
+    }
+}
+
+pub type NetTickSamples = Vec<(String, u64, u64)>;
+
+fn push_capped<T>(queue: &mut VecDeque<T>, value: T, capacity: usize) {
+    queue.push_back(value);
+    while queue.len() > capacity {
+        queue.pop_front();
+    }
+}
+
 /// A remote machine managed by NTX Panel.
 #[derive(Debug)]
 pub struct Device {
@@ -913,13 +1223,20 @@ pub struct Device {
     pub latest_metrics: Option<ntx_proto::SystemMetrics>,
     pub cpu_history: VecDeque<f64>,
     pub ram_history: VecDeque<f64>,
+    pub ram_used_history: VecDeque<u64>,
     pub rx_history: VecDeque<f64>,
     pub tx_history: VecDeque<f64>,
+    pub disk_read_history: VecDeque<f64>,
+    pub disk_write_history: VecDeque<f64>,
+    pub metrics_timestamps_ms: VecDeque<u64>,
+    pub net_samples: VecDeque<NetTickSamples>,
     pub terminal: TerminalEmulator,
     pub terminal_state: TerminalSessionState,
     pub pending_terminal_command: Option<String>,
     pub process_state: ProcessState,
     pub favorites: Vec<FavoriteApp>,
+    pub managed_services: ManagedServicesState,
+    pub docker_state: DockerState,
 }
 
 impl Device {
@@ -949,13 +1266,20 @@ impl Device {
             latest_metrics: None,
             cpu_history: VecDeque::with_capacity(120),
             ram_history: VecDeque::with_capacity(120),
+            ram_used_history: VecDeque::with_capacity(120),
             rx_history: VecDeque::with_capacity(120),
             tx_history: VecDeque::with_capacity(120),
+            disk_read_history: VecDeque::with_capacity(120),
+            disk_write_history: VecDeque::with_capacity(120),
+            metrics_timestamps_ms: VecDeque::with_capacity(120),
+            net_samples: VecDeque::with_capacity(120),
             terminal: TerminalEmulator::default(),
             terminal_state: TerminalSessionState::Idle,
             pending_terminal_command: None,
             process_state: ProcessState::default(),
             favorites: Vec::new(),
+            managed_services: ManagedServicesState::default(),
+            docker_state: DockerState::default(),
         }
     }
 
@@ -1003,20 +1327,16 @@ impl Device {
             return;
         }
 
-        self.cpu_history.push_back(metrics.cpu_usage_percent);
-        while self.cpu_history.len() > capacity {
-            self.cpu_history.pop_front();
-        }
+        push_capped(&mut self.cpu_history, metrics.cpu_usage_percent, capacity);
 
         let ram_pct = if metrics.total_memory_bytes > 0 {
             (metrics.used_memory_bytes as f64 / metrics.total_memory_bytes as f64) * 100.0
         } else {
             0.0
         };
-        self.ram_history.push_back(ram_pct);
-        while self.ram_history.len() > capacity {
-            self.ram_history.pop_front();
-        }
+        push_capped(&mut self.ram_history, ram_pct, capacity);
+        push_capped(&mut self.ram_used_history, metrics.used_memory_bytes, capacity);
+        push_capped(&mut self.metrics_timestamps_ms, metrics.timestamp_ms, capacity);
 
         let total_rx: u64 = metrics
             .network_metrics
@@ -1029,17 +1349,55 @@ impl Device {
             .map(|n| n.tx_bytes_per_sec)
             .sum();
 
-        self.rx_history.push_back(total_rx as f64);
-        while self.rx_history.len() > capacity {
-            self.rx_history.pop_front();
-        }
+        push_capped(&mut self.rx_history, total_rx as f64, capacity);
+        push_capped(&mut self.tx_history, total_tx as f64, capacity);
 
-        self.tx_history.push_back(total_tx as f64);
-        while self.tx_history.len() > capacity {
-            self.tx_history.pop_front();
+        let per_iface: NetTickSamples = metrics
+            .network_metrics
+            .iter()
+            .map(|n| (n.interface_name.clone(), n.rx_bytes_per_sec, n.tx_bytes_per_sec))
+            .collect();
+        push_capped(&mut self.net_samples, per_iface, capacity);
+
+        let mut seen_mounts: HashSet<&str> = HashSet::new();
+        let mut total_disk_read: u64 = 0;
+        let mut total_disk_write: u64 = 0;
+        for dm in &metrics.disk_metrics {
+            if !seen_mounts.insert(dm.mount_point.as_str()) {
+                continue;
+            }
+            let fs_name = self
+                .system_info
+                .as_ref()
+                .and_then(|info| {
+                    info.disks
+                        .iter()
+                        .find(|d| d.mount_point == dm.mount_point)
+                        .map(|d| d.filesystem.as_str())
+                })
+                .unwrap_or("");
+            if is_virtual_disk(&dm.mount_point, fs_name) {
+                continue;
+            }
+            total_disk_read = total_disk_read.saturating_add(dm.read_bytes_per_sec);
+            total_disk_write = total_disk_write.saturating_add(dm.write_bytes_per_sec);
         }
+        push_capped(&mut self.disk_read_history, total_disk_read as f64, capacity);
+        push_capped(&mut self.disk_write_history, total_disk_write as f64, capacity);
 
         self.latest_metrics = Some(metrics);
+    }
+
+    pub fn clear_metrics_history(&mut self) {
+        self.cpu_history.clear();
+        self.ram_history.clear();
+        self.ram_used_history.clear();
+        self.rx_history.clear();
+        self.tx_history.clear();
+        self.disk_read_history.clear();
+        self.disk_write_history.clear();
+        self.metrics_timestamps_ms.clear();
+        self.net_samples.clear();
     }
 }
 
@@ -1080,6 +1438,7 @@ pub struct AppSettings {
     pub terminal_font_size: f32,
     pub hide_virtual_disks: bool,
     pub hide_virtual_interfaces: bool,
+    pub overview_view_mode: OverviewViewMode,
     pub device_psks: HashMap<String, String>,
     pub manual_devices: Vec<ManualDevice>,
     pub known_devices: Vec<KnownDevice>,
@@ -1099,6 +1458,7 @@ impl Default for AppSettings {
             terminal_font_size: 13.0,
             hide_virtual_disks: true,
             hide_virtual_interfaces: true,
+            overview_view_mode: OverviewViewMode::Cards,
             device_psks: HashMap::new(),
             manual_devices: Vec::new(),
             known_devices: Vec::new(),
@@ -1737,5 +2097,303 @@ mod tests {
         assert!(!is_virtual_interface("eth0"));
         assert!(!is_virtual_interface("wlan0"));
         assert!(!is_virtual_interface("tailscale0"));
+    }
+
+    #[test]
+    fn test_settings_overview_view_mode_persistence_and_default() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.overview_view_mode, OverviewViewMode::Cards);
+
+        settings.overview_view_mode = OverviewViewMode::Table;
+        let toml_str = toml::to_string_pretty(&settings).unwrap();
+        let loaded: Settings = toml::from_str(&toml_str).unwrap();
+        assert_eq!(loaded.overview_view_mode, OverviewViewMode::Table);
+
+        // Legacy TOML missing `overview_view_mode` must default to Cards
+        let legacy_toml = r#"
+            default_psk = ""
+            viewer_id = "v-legacy"
+            refresh_rate_ms = 1000
+            history_capacity = 60
+            dark_mode = true
+        "#;
+        let legacy_loaded: Settings = toml::from_str(legacy_toml).unwrap();
+        assert_eq!(legacy_loaded.overview_view_mode, OverviewViewMode::Cards);
+    }
+
+    #[test]
+    fn test_record_metrics_tracks_disk_io_net_samples_and_clear() {
+        let mut dev = Device::new(
+            "dev-io".to_string(),
+            "srv-io".to_string(),
+            vec!["192.168.1.20".to_string()],
+            9850,
+            "0.3.0".to_string(),
+        );
+        dev.system_info = Some(ntx_proto::SystemInfo {
+            disks: vec![
+                ntx_proto::DiskInfo {
+                    name: "sda1".to_string(),
+                    mount_point: "/".to_string(),
+                    total_bytes: 100_000,
+                    available_bytes: 50_000,
+                    filesystem: "ext4".to_string(),
+                },
+                ntx_proto::DiskInfo {
+                    name: "tmpfs".to_string(),
+                    mount_point: "/run".to_string(),
+                    total_bytes: 10_000,
+                    available_bytes: 9_000,
+                    filesystem: "tmpfs".to_string(),
+                },
+            ],
+            ..Default::default()
+        });
+
+        for tick in 1..=3u64 {
+            let m = ntx_proto::SystemMetrics {
+                cpu_usage_percent: tick as f64 * 10.0,
+                used_memory_bytes: tick * 1000,
+                total_memory_bytes: 10_000,
+                disk_metrics: vec![
+                    ntx_proto::DiskMetrics {
+                        mount_point: "/".to_string(),
+                        used_bytes: 50_000,
+                        total_bytes: 100_000,
+                        read_bytes_per_sec: tick * 2048,
+                        write_bytes_per_sec: tick * 1024,
+                    },
+                    // Duplicate mount_point should be deduplicated
+                    ntx_proto::DiskMetrics {
+                        mount_point: "/".to_string(),
+                        used_bytes: 50_000,
+                        total_bytes: 100_000,
+                        read_bytes_per_sec: 999_999,
+                        write_bytes_per_sec: 999_999,
+                    },
+                    // Virtual disk should be excluded
+                    ntx_proto::DiskMetrics {
+                        mount_point: "/run".to_string(),
+                        used_bytes: 1000,
+                        total_bytes: 10_000,
+                        read_bytes_per_sec: 555_555,
+                        write_bytes_per_sec: 555_555,
+                    },
+                ],
+                network_metrics: vec![
+                    ntx_proto::NetworkMetrics {
+                        interface_name: "eth0".to_string(),
+                        rx_bytes_per_sec: tick * 500,
+                        tx_bytes_per_sec: tick * 250,
+                    },
+                    ntx_proto::NetworkMetrics {
+                        interface_name: "lo".to_string(),
+                        rx_bytes_per_sec: 10_000,
+                        tx_bytes_per_sec: 10_000,
+                    },
+                ],
+                timestamp_ms: 1000 + tick,
+            };
+            dev.record_metrics(m, 2);
+        }
+
+        // Capacity=2 keeps only ticks 2 and 3
+        assert_eq!(dev.cpu_history.len(), 2);
+        assert_eq!(dev.ram_used_history, VecDeque::from([2000, 3000]));
+        assert_eq!(dev.metrics_timestamps_ms, VecDeque::from([1002, 1003]));
+        assert_eq!(dev.disk_read_history, VecDeque::from([4096.0, 6144.0]));
+        assert_eq!(dev.disk_write_history, VecDeque::from([2048.0, 3072.0]));
+        assert_eq!(dev.net_samples.len(), 2);
+        assert_eq!(dev.net_samples[1].len(), 2);
+        assert_eq!(dev.net_samples[1][0], ("eth0".to_string(), 1500, 750));
+
+        dev.clear_metrics_history();
+        assert!(dev.cpu_history.is_empty());
+        assert!(dev.ram_history.is_empty());
+        assert!(dev.ram_used_history.is_empty());
+        assert!(dev.rx_history.is_empty());
+        assert!(dev.tx_history.is_empty());
+        assert!(dev.disk_read_history.is_empty());
+        assert!(dev.disk_write_history.is_empty());
+        assert!(dev.metrics_timestamps_ms.is_empty());
+        assert!(dev.net_samples.is_empty());
+    }
+
+    #[test]
+    fn test_docker_console_mode_helpers() {
+        assert_eq!(DockerConsoleMode::default(), DockerConsoleMode::Logs);
+        assert_eq!(DockerConsoleMode::Logs.as_proto_mode(), "logs");
+        assert_eq!(DockerConsoleMode::Attach.as_proto_mode(), "attach");
+        assert_eq!(DockerConsoleMode::Shell.as_proto_mode(), "shell");
+        assert_eq!(DockerConsoleMode::Logs.display_label(), "📜 Logs");
+        assert_eq!(DockerConsoleMode::Attach.display_label(), "⌨ Attach (stdin)");
+        assert_eq!(DockerConsoleMode::Shell.display_label(), "💻 Shell");
+    }
+
+    #[test]
+    fn test_managed_services_state_counts_selection_and_reset() {
+        let mut st = ManagedServicesState::default();
+        assert_eq!(st.console_state, ConsoleStreamState::Idle);
+        assert_eq!(st.service_counts(), (0, 0, 0, 0));
+        assert!(st.selected_service().is_none());
+
+        st.set_status("Service démarré", false);
+        assert_eq!(st.status_message, Some(("Service démarré".to_string(), false)));
+        st.clear_status();
+        assert!(st.status_message.is_none());
+
+        let make_svc = |id: &str, state: &str| ntx_proto::ManagedServiceStatus {
+            config: Some(ntx_proto::ManagedServiceConfig {
+                id: id.to_string(),
+                name: format!("Svc {id}"),
+                ..Default::default()
+            }),
+            state: state.to_string(),
+            ..Default::default()
+        };
+
+        st.services = vec![
+            make_svc("mc", "running"),
+            make_svc("bot", "stopped"),
+            make_svc("api", "crashed"),
+            make_svc("init", "starting"),
+        ];
+        assert_eq!(st.service_counts(), (4, 1, 1, 1));
+
+        st.selected_service_id = Some("bot".to_string());
+        assert_eq!(
+            st.selected_service()
+                .and_then(|s| s.config.as_ref())
+                .map(|c| c.id.as_str()),
+            Some("bot")
+        );
+
+        st.is_loading = true;
+        st.unsupported_by_server = true;
+        st.console_state = ConsoleStreamState::Streaming;
+        st.console_service_id = Some("mc".to_string());
+        st.console_buffer.push_bytes(b"hello\n");
+
+        st.reset_on_disconnect();
+        assert!(st.services.is_empty());
+        assert!(!st.is_loading);
+        assert!(!st.unsupported_by_server);
+        assert_eq!(st.console_state, ConsoleStreamState::Idle);
+        assert!(st.console_service_id.is_none());
+        assert_eq!(st.console_buffer.line_count(), 1);
+    }
+
+    #[test]
+    fn test_docker_state_counts_selection_and_reset() {
+        let mut st = DockerState::default();
+        assert!(st.docker_available);
+        assert!(st.include_all);
+        assert_eq!(st.console_mode, DockerConsoleMode::Logs);
+        assert_eq!(st.console_state, ConsoleStreamState::Idle);
+        assert_eq!(st.container_counts(), (0, 0, 0, 0));
+
+        st.set_status("Conteneur redémarré", false);
+        assert_eq!(
+            st.status_message,
+            Some(("Conteneur redémarré".to_string(), false))
+        );
+        st.clear_status();
+        assert!(st.status_message.is_none());
+
+        let make_c = |id: &str, state: &str| ntx_proto::DockerContainerItem {
+            id: id.to_string(),
+            name: format!("c-{id}"),
+            state: state.to_string(),
+            ..Default::default()
+        };
+
+        st.containers = vec![
+            make_c("c1", "running"),
+            make_c("c2", "paused"),
+            make_c("c3", "exited"),
+            make_c("c4", "dead"),
+            make_c("c5", "restarting"),
+        ];
+        assert_eq!(st.container_counts(), (5, 1, 1, 2));
+
+        st.selected_container_id = Some("c2".to_string());
+        assert_eq!(st.selected_container().map(|c| c.name.as_str()), Some("c-c2"));
+
+        st.docker_available = false;
+        st.docker_version = "27.1.0".to_string();
+        st.docker_error = Some("daemon down".to_string());
+        st.is_loading = true;
+        st.unsupported_by_server = true;
+        st.console_state = ConsoleStreamState::Streaming;
+        st.console_container_id = Some("c1".to_string());
+
+        st.reset_on_disconnect();
+        assert!(st.containers.is_empty());
+        assert!(st.docker_available);
+        assert!(st.docker_version.is_empty());
+        assert!(st.docker_error.is_none());
+        assert!(!st.is_loading);
+        assert!(!st.unsupported_by_server);
+        assert_eq!(st.console_state, ConsoleStreamState::Idle);
+        assert!(st.console_container_id.is_none());
+    }
+
+    #[test]
+    fn test_favorite_app_to_managed_config_migration() {
+        let mc_fav = FavoriteApp::new(
+            "mc-srv 01",
+            "Serveur Minecraft",
+            "⛏",
+            FavoriteAppType::Process,
+            "minecraft_server",
+            None,
+            "tmux attach -t minecraft",
+            "Monde survie",
+            Some("java -Xmx2G -jar server.jar nogui".to_string()),
+        );
+        let mc_cfg = favorite_app_to_managed_config(&mc_fav);
+        assert_eq!(mc_cfg.id, "mc-srv_01");
+        assert_eq!(mc_cfg.name, "Serveur Minecraft");
+        assert_eq!(mc_cfg.icon, "⛏");
+        assert_eq!(mc_cfg.command, "java -Xmx2G -jar server.jar nogui");
+        assert_eq!(mc_cfg.attach_command, "tmux attach -t minecraft");
+        assert_eq!(mc_cfg.stop_command, "stop");
+        assert!(mc_cfg.quick_commands.contains(&"list".to_string()));
+        assert!(mc_cfg.quick_commands.contains(&"save-all".to_string()));
+
+        let svc_fav = FavoriteApp::new(
+            "nginx-1",
+            "Nginx",
+            "🌐",
+            FavoriteAppType::Service,
+            "nginx",
+            Some("nginx.service".to_string()),
+            "journalctl -u nginx -f",
+            "Reverse proxy",
+            None,
+        );
+        let svc_cfg = favorite_app_to_managed_config(&svc_fav);
+        assert_eq!(svc_cfg.id, "nginx-1");
+        assert_eq!(svc_cfg.systemd_unit, "nginx.service");
+        assert_eq!(svc_cfg.attach_command, "journalctl -u nginx -f");
+        assert!(svc_cfg.command.is_empty());
+        assert!(svc_cfg.stop_command.is_empty());
+
+        let docker_fav = FavoriteApp::new(
+            "",
+            "  ",
+            "",
+            FavoriteAppType::Docker,
+            "postgres",
+            None,
+            "",
+            "",
+            None,
+        );
+        let docker_cfg = favorite_app_to_managed_config(&docker_fav);
+        assert!(docker_cfg.id.is_empty());
+        assert_eq!(docker_cfg.name, "Service migré");
+        assert_eq!(docker_cfg.icon, "⭐");
+        assert_eq!(docker_cfg.attach_command, "docker logs -f postgres");
     }
 }

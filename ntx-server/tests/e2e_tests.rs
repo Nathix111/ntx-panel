@@ -4,8 +4,12 @@ use ntx_proto::ntx_agent_client::NtxAgentClient;
 use ntx_proto::ntx_agent_server::NtxAgentServer;
 use ntx_proto::terminal_input::Input;
 use ntx_proto::{
-    AuthChallengeRequest, AuthRequest, ControlServiceRequest, Empty, KillProcessRequest,
-    ListProcessesRequest, ListServicesRequest, MetricsRequest, TerminalInput, TerminalResize,
+    AuthChallengeRequest, AuthRequest, ControlDockerContainerRequest, ControlManagedServiceRequest,
+    ControlServiceRequest, DeleteManagedServiceRequest, Empty, ExecDockerCommandRequest,
+    KillProcessRequest, ListDockerContainersRequest, ListManagedServicesRequest,
+    ListProcessesRequest, ListServicesRequest, ManagedServiceConfig, MetricsRequest,
+    SaveManagedServiceRequest, SendManagedServiceInputRequest, StreamManagedServiceConsoleRequest,
+    TerminalInput, TerminalResize,
 };
 use ntx_server::auth::{compute_challenge_hmac, derive_psk_key, AuthManager, AUTH_HEADER};
 use ntx_server::config::Config;
@@ -467,4 +471,246 @@ async fn test_auth_rejection_and_rate_limiting_e2e() {
         }))
         .await;
     assert_eq!(rate_limited.unwrap_err().code(), Code::ResourceExhausted);
+}
+
+#[tokio::test]
+async fn test_managed_services_and_docker_e2e() {
+    let psk = "ntx_managed_docker_e2e_key";
+    let (addr, tls_material, _shutdown) = start_test_server(psk).await;
+    let mut client = connect_tls_client(addr, &tls_material).await;
+
+    // 1. Unauthenticated Managed Services & Docker calls must fail.
+    assert!(client
+        .list_managed_services(Request::new(ListManagedServicesRequest {}))
+        .await
+        .is_err());
+    assert!(client
+        .list_docker_containers(Request::new(ListDockerContainersRequest {
+            include_all: true,
+        }))
+        .await
+        .is_err());
+
+    let session_token = authenticate_client(&mut client, psk, "viewer-managed-e2e").await;
+
+    fn authed_request<T>(payload: T, token: &str) -> Request<T> {
+        let mut req = Request::new(payload);
+        req.metadata_mut()
+            .insert(AUTH_HEADER, MetadataValue::from_str(token).unwrap());
+        req
+    }
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "ntx_e2e_managed_svc_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    #[cfg(unix)]
+    let cmd =
+        r#"echo READY; while IFS= read -r line; do echo "ECHO:$line"; [ "$line" = "quit" ] && exit 0; done"#
+            .to_string();
+    #[cfg(windows)]
+    let cmd = {
+        let script = temp_dir.join("e2e_echo.cmd");
+        std::fs::write(
+            &script,
+            "@echo off\r\necho READY\r\n:loop\r\nset \"line=\"\r\nset /p \"line=\"\r\necho ECHO:%line%\r\nif \"%line%\"==\"quit\" exit /b 0\r\ngoto loop\r\n",
+        )
+        .unwrap();
+        script.to_string_lossy().to_string()
+    };
+
+    // 2. SaveManagedService
+    let save_resp = client
+        .save_managed_service(authed_request(
+            SaveManagedServiceRequest {
+                config: Some(ManagedServiceConfig {
+                    id: "e2e-echo".to_string(),
+                    name: "E2E Echo Service".to_string(),
+                    icon: "⚙".to_string(),
+                    description: "Interactive E2E test".to_string(),
+                    command: cmd,
+                    working_dir: temp_dir.to_string_lossy().to_string(),
+                    stop_command: "quit".to_string(),
+                    auto_start: false,
+                    auto_restart: false,
+                    env_vars: vec!["E2E_ENV=ok".to_string()],
+                    quick_commands: vec!["help".to_string()],
+                    systemd_unit: String::new(),
+                    attach_command: String::new(),
+                }),
+            },
+            &session_token,
+        ))
+        .await
+        .expect("SaveManagedService RPC should succeed")
+        .into_inner();
+    assert!(save_resp.success, "Save failed: {}", save_resp.error_message);
+    assert_eq!(save_resp.service.unwrap().id, "e2e-echo");
+
+    // 3. StreamManagedServiceConsole (subscribe before start)
+    let mut console_stream = client
+        .stream_managed_service_console(authed_request(
+            StreamManagedServiceConsoleRequest {
+                id: "e2e-echo".to_string(),
+                tail_lines: 50,
+            },
+            &session_token,
+        ))
+        .await
+        .expect("StreamManagedServiceConsole should open")
+        .into_inner();
+
+    // 4. ControlManagedService(start)
+    let start_resp = client
+        .control_managed_service(authed_request(
+            ControlManagedServiceRequest {
+                id: "e2e-echo".to_string(),
+                action: "start".to_string(),
+            },
+            &session_token,
+        ))
+        .await
+        .expect("ControlManagedService(start) RPC should succeed")
+        .into_inner();
+    assert!(start_resp.success, "Start failed: {}", start_resp.error_message);
+
+    let mut received = String::new();
+    let ready_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    while !received.contains("READY") {
+        let rem = ready_deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!rem.is_zero(), "Timed out waiting for READY; got: {:?}", received);
+        let chunk = tokio::time::timeout(rem, console_stream.next())
+            .await
+            .expect("stream READY timeout")
+            .expect("stream unexpectedly closed")
+            .expect("chunk ok");
+        received.push_str(&String::from_utf8_lossy(&chunk.data));
+    }
+
+    // 5. SendManagedServiceInput -> verify live echo in stream
+    let input_resp = client
+        .send_managed_service_input(authed_request(
+            SendManagedServiceInputRequest {
+                id: "e2e-echo".to_string(),
+                input: "hello_e2e".to_string(),
+                append_newline: true,
+            },
+            &session_token,
+        ))
+        .await
+        .expect("SendManagedServiceInput RPC should succeed")
+        .into_inner();
+    assert!(input_resp.success, "Input failed: {}", input_resp.error_message);
+
+    let echo_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    while !received.contains("ECHO:hello_e2e") {
+        let rem = echo_deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !rem.is_zero(),
+            "Timed out waiting for ECHO:hello_e2e; got: {:?}",
+            received
+        );
+        let chunk = tokio::time::timeout(rem, console_stream.next())
+            .await
+            .expect("stream echo timeout")
+            .expect("stream unexpectedly closed")
+            .expect("chunk ok");
+        received.push_str(&String::from_utf8_lossy(&chunk.data));
+    }
+
+    // 6. ControlManagedService(stop) -> clean graceful exit via stop_command = "quit"
+    let stop_resp = client
+        .control_managed_service(authed_request(
+            ControlManagedServiceRequest {
+                id: "e2e-echo".to_string(),
+                action: "stop".to_string(),
+            },
+            &session_token,
+        ))
+        .await
+        .expect("ControlManagedService(stop) RPC should succeed")
+        .into_inner();
+    assert!(stop_resp.success, "Stop failed: {}", stop_resp.error_message);
+
+    let listed = client
+        .list_managed_services(authed_request(
+            ListManagedServicesRequest {},
+            &session_token,
+        ))
+        .await
+        .expect("ListManagedServices RPC should succeed")
+        .into_inner();
+    assert_eq!(listed.services.len(), 1);
+    assert_eq!(listed.services[0].state, "stopped");
+    assert!(listed.services[0].has_exit_code);
+    assert_eq!(listed.services[0].last_exit_code, 0);
+
+    // 7. DeleteManagedService -> removed
+    let del_resp = client
+        .delete_managed_service(authed_request(
+            DeleteManagedServiceRequest {
+                id: "e2e-echo".to_string(),
+            },
+            &session_token,
+        ))
+        .await
+        .expect("DeleteManagedService RPC should succeed")
+        .into_inner();
+    assert!(del_resp.success);
+
+    let listed_after = client
+        .list_managed_services(authed_request(
+            ListManagedServicesRequest {},
+            &session_token,
+        ))
+        .await
+        .expect("ListManagedServices after delete should succeed")
+        .into_inner();
+    assert!(listed_after.services.is_empty());
+
+    // 8. Docker RPCs over TLS gRPC: ListDockerContainers + invalid ID checks
+    let docker_list = client
+        .list_docker_containers(authed_request(
+            ListDockerContainersRequest { include_all: true },
+            &session_token,
+        ))
+        .await
+        .expect("ListDockerContainers RPC should succeed")
+        .into_inner();
+    if !docker_list.docker_available {
+        assert!(!docker_list.error_message.is_empty());
+    }
+
+    let docker_bad_ctrl = client
+        .control_docker_container(authed_request(
+            ControlDockerContainerRequest {
+                container_id: "--bad-id".to_string(),
+                action: "start".to_string(),
+                force: false,
+            },
+            &session_token,
+        ))
+        .await
+        .expect("ControlDockerContainer RPC should return validation failure")
+        .into_inner();
+    assert!(!docker_bad_ctrl.success);
+    assert!(!docker_bad_ctrl.error_message.is_empty());
+
+    let docker_bad_exec = client
+        .exec_docker_command(authed_request(
+            ExecDockerCommandRequest {
+                container_id: "bad;id".to_string(),
+                command: "echo hi".to_string(),
+            },
+            &session_token,
+        ))
+        .await
+        .expect("ExecDockerCommand RPC should return validation failure")
+        .into_inner();
+    assert!(!docker_bad_exec.success);
+    assert!(!docker_bad_exec.error_message.is_empty());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
 }

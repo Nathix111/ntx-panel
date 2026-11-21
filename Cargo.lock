@@ -2335,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "ntx-proto"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "prost",
  "prost-types",
@@ -2346,7 +2346,7 @@ dependencies = [
 
 [[package]]
 name = "ntx-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2380,7 +2380,7 @@ dependencies = [
 
 [[package]]
 name = "ntx-viewer"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "eframe",

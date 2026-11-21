@@ -338,6 +338,86 @@ mod tests {
                 {
                     unimplemented!()
                 }
+                async fn list_managed_services(
+                    &self,
+                    _: tonic::Request<ntx_proto::ListManagedServicesRequest>,
+                ) -> Result<tonic::Response<ntx_proto::ListManagedServicesResponse>, tonic::Status>
+                {
+                    unimplemented!()
+                }
+                async fn save_managed_service(
+                    &self,
+                    _: tonic::Request<ntx_proto::SaveManagedServiceRequest>,
+                ) -> Result<tonic::Response<ntx_proto::SaveManagedServiceResponse>, tonic::Status>
+                {
+                    unimplemented!()
+                }
+                async fn delete_managed_service(
+                    &self,
+                    _: tonic::Request<ntx_proto::DeleteManagedServiceRequest>,
+                ) -> Result<tonic::Response<ntx_proto::DeleteManagedServiceResponse>, tonic::Status>
+                {
+                    unimplemented!()
+                }
+                async fn control_managed_service(
+                    &self,
+                    _: tonic::Request<ntx_proto::ControlManagedServiceRequest>,
+                ) -> Result<tonic::Response<ntx_proto::ControlManagedServiceResponse>, tonic::Status>
+                {
+                    unimplemented!()
+                }
+                async fn send_managed_service_input(
+                    &self,
+                    _: tonic::Request<ntx_proto::SendManagedServiceInputRequest>,
+                ) -> Result<
+                    tonic::Response<ntx_proto::SendManagedServiceInputResponse>,
+                    tonic::Status,
+                > {
+                    unimplemented!()
+                }
+                type StreamManagedServiceConsoleStream =
+                    tokio_stream::wrappers::ReceiverStream<Result<ntx_proto::ConsoleChunk, tonic::Status>>;
+                async fn stream_managed_service_console(
+                    &self,
+                    _: tonic::Request<ntx_proto::StreamManagedServiceConsoleRequest>,
+                ) -> Result<
+                    tonic::Response<Self::StreamManagedServiceConsoleStream>,
+                    tonic::Status,
+                > {
+                    unimplemented!()
+                }
+                async fn list_docker_containers(
+                    &self,
+                    _: tonic::Request<ntx_proto::ListDockerContainersRequest>,
+                ) -> Result<tonic::Response<ntx_proto::ListDockerContainersResponse>, tonic::Status>
+                {
+                    unimplemented!()
+                }
+                async fn control_docker_container(
+                    &self,
+                    _: tonic::Request<ntx_proto::ControlDockerContainerRequest>,
+                ) -> Result<
+                    tonic::Response<ntx_proto::ControlDockerContainerResponse>,
+                    tonic::Status,
+                > {
+                    unimplemented!()
+                }
+                async fn exec_docker_command(
+                    &self,
+                    _: tonic::Request<ntx_proto::ExecDockerCommandRequest>,
+                ) -> Result<tonic::Response<ntx_proto::ExecDockerCommandResponse>, tonic::Status>
+                {
+                    unimplemented!()
+                }
+                type StreamDockerConsoleStream =
+                    tokio_stream::wrappers::ReceiverStream<Result<ntx_proto::ConsoleChunk, tonic::Status>>;
+                async fn stream_docker_console(
+                    &self,
+                    _: tonic::Request<tonic::Streaming<ntx_proto::DockerConsoleInput>>,
+                ) -> Result<tonic::Response<Self::StreamDockerConsoleStream>, tonic::Status>
+                {
+                    unimplemented!()
+                }
             }
 
             Server::builder()

@@ -2,16 +2,24 @@
 
 use crate::auth::{AuthFailure, AuthManager};
 use crate::config::{get_hostname, Config};
+use crate::docker;
+use crate::managed_service::ManagedServiceManager;
 use crate::monitoring::{self, collect_system_info};
 use crate::process;
 use crate::service_manager;
 use crate::terminal;
 use ntx_proto::ntx_agent_server::NtxAgent;
 use ntx_proto::{
-    AuthChallengeRequest, AuthChallengeResponse, AuthRequest, AuthResponse, ControlServiceRequest,
-    ControlServiceResponse, Empty, KillProcessRequest, KillProcessResponse, ListProcessesRequest,
-    ListProcessesResponse, ListServicesRequest, ListServicesResponse, MetricsRequest, PingResponse,
-    SystemInfo, SystemMetrics, TerminalInput, TerminalOutput,
+    AuthChallengeRequest, AuthChallengeResponse, AuthRequest, AuthResponse, ConsoleChunk,
+    ControlDockerContainerRequest, ControlDockerContainerResponse, ControlManagedServiceRequest,
+    ControlManagedServiceResponse, ControlServiceRequest, ControlServiceResponse,
+    DeleteManagedServiceRequest, DeleteManagedServiceResponse, DockerConsoleInput, Empty,
+    ExecDockerCommandRequest, ExecDockerCommandResponse, KillProcessRequest, KillProcessResponse,
+    ListDockerContainersRequest, ListDockerContainersResponse, ListManagedServicesRequest,
+    ListManagedServicesResponse, ListProcessesRequest, ListProcessesResponse, ListServicesRequest,
+    ListServicesResponse, MetricsRequest, PingResponse, SaveManagedServiceRequest,
+    SaveManagedServiceResponse, SendManagedServiceInputRequest, SendManagedServiceInputResponse,
+    StreamManagedServiceConsoleRequest, SystemInfo, SystemMetrics, TerminalInput, TerminalOutput,
 };
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,14 +32,28 @@ use tracing::{info, warn};
 pub struct NtxAgentService {
     config: Config,
     auth: AuthManager,
+    managed_services: ManagedServiceManager,
     start_time: Instant,
 }
 
 impl NtxAgentService {
     pub fn new(config: Config, auth: AuthManager) -> Self {
+        Self::with_managed_services(
+            config,
+            auth,
+            ManagedServiceManager::in_memory_for_tests(),
+        )
+    }
+
+    pub fn with_managed_services(
+        config: Config,
+        auth: AuthManager,
+        managed_services: ManagedServiceManager,
+    ) -> Self {
         Self {
             config,
             auth,
+            managed_services,
             start_time: Instant::now(),
         }
     }
@@ -304,6 +326,161 @@ impl NtxAgent for NtxAgentService {
             error_message,
         }))
     }
+
+    async fn list_managed_services(
+        &self,
+        request: Request<ListManagedServicesRequest>,
+    ) -> Result<Response<ListManagedServicesResponse>, Status> {
+        self.auth.verify_request(&request)?;
+        let services = self.managed_services.list_services().await;
+        Ok(Response::new(ListManagedServicesResponse { services }))
+    }
+
+    async fn save_managed_service(
+        &self,
+        request: Request<SaveManagedServiceRequest>,
+    ) -> Result<Response<SaveManagedServiceResponse>, Status> {
+        self.auth.verify_request(&request)?;
+        let Some(cfg) = request.into_inner().config else {
+            return Ok(Response::new(SaveManagedServiceResponse {
+                success: false,
+                error_message: "Configuration du service géré manquante.".to_string(),
+                service: None,
+            }));
+        };
+
+        let resp = match self.managed_services.save_service(cfg).await {
+            Ok(service) => SaveManagedServiceResponse {
+                success: true,
+                error_message: String::new(),
+                service: Some(service),
+            },
+            Err(error_message) => SaveManagedServiceResponse {
+                success: false,
+                error_message,
+                service: None,
+            },
+        };
+        Ok(Response::new(resp))
+    }
+
+    async fn delete_managed_service(
+        &self,
+        request: Request<DeleteManagedServiceRequest>,
+    ) -> Result<Response<DeleteManagedServiceResponse>, Status> {
+        self.auth.verify_request(&request)?;
+        let req = request.into_inner();
+        let (success, error_message) = match self.managed_services.delete_service(&req.id).await {
+            Ok(()) => (true, String::new()),
+            Err(e) => (false, e),
+        };
+        Ok(Response::new(DeleteManagedServiceResponse {
+            success,
+            error_message,
+        }))
+    }
+
+    async fn control_managed_service(
+        &self,
+        request: Request<ControlManagedServiceRequest>,
+    ) -> Result<Response<ControlManagedServiceResponse>, Status> {
+        self.auth.verify_request(&request)?;
+        let req = request.into_inner();
+        let (success, error_message) = match self
+            .managed_services
+            .control_service(&req.id, &req.action)
+            .await
+        {
+            Ok(()) => (true, String::new()),
+            Err(e) => (false, e),
+        };
+        Ok(Response::new(ControlManagedServiceResponse {
+            success,
+            error_message,
+        }))
+    }
+
+    async fn send_managed_service_input(
+        &self,
+        request: Request<SendManagedServiceInputRequest>,
+    ) -> Result<Response<SendManagedServiceInputResponse>, Status> {
+        self.auth.verify_request(&request)?;
+        let req = request.into_inner();
+        let (success, error_message) = match self
+            .managed_services
+            .send_input(&req.id, &req.input, req.append_newline)
+            .await
+        {
+            Ok(()) => (true, String::new()),
+            Err(e) => (false, e),
+        };
+        Ok(Response::new(SendManagedServiceInputResponse {
+            success,
+            error_message,
+        }))
+    }
+
+    type StreamManagedServiceConsoleStream = ReceiverStream<Result<ConsoleChunk, Status>>;
+
+    async fn stream_managed_service_console(
+        &self,
+        request: Request<StreamManagedServiceConsoleRequest>,
+    ) -> Result<Response<Self::StreamManagedServiceConsoleStream>, Status> {
+        self.auth.verify_request(&request)?;
+        let req = request.into_inner();
+        let stream = self
+            .managed_services
+            .stream_console(&req.id, req.tail_lines)
+            .await?;
+        Ok(Response::new(stream))
+    }
+
+    async fn list_docker_containers(
+        &self,
+        request: Request<ListDockerContainersRequest>,
+    ) -> Result<Response<ListDockerContainersResponse>, Status> {
+        self.auth.verify_request(&request)?;
+        let req = request.into_inner();
+        let resp = docker::list_containers(req.include_all).await;
+        Ok(Response::new(resp))
+    }
+
+    async fn control_docker_container(
+        &self,
+        request: Request<ControlDockerContainerRequest>,
+    ) -> Result<Response<ControlDockerContainerResponse>, Status> {
+        self.auth.verify_request(&request)?;
+        let req = request.into_inner();
+        let (success, error_message) =
+            match docker::control_container(&req.container_id, &req.action, req.force).await {
+                Ok(()) => (true, String::new()),
+                Err(e) => (false, e),
+            };
+        Ok(Response::new(ControlDockerContainerResponse {
+            success,
+            error_message,
+        }))
+    }
+
+    async fn exec_docker_command(
+        &self,
+        request: Request<ExecDockerCommandRequest>,
+    ) -> Result<Response<ExecDockerCommandResponse>, Status> {
+        self.auth.verify_request(&request)?;
+        let req = request.into_inner();
+        let resp = docker::exec_command(&req.container_id, &req.command).await;
+        Ok(Response::new(resp))
+    }
+
+    type StreamDockerConsoleStream = ReceiverStream<Result<ConsoleChunk, Status>>;
+
+    async fn stream_docker_console(
+        &self,
+        request: Request<Streaming<DockerConsoleInput>>,
+    ) -> Result<Response<Self::StreamDockerConsoleStream>, Status> {
+        self.auth.verify_request(&request)?;
+        docker::handle_stream_docker_console(request).await
+    }
 }
 
 #[cfg(test)]
@@ -549,5 +726,343 @@ mod tests {
         let ctrl_resp = service.control_service(ctrl_req).await.unwrap().into_inner();
         assert!(!ctrl_resp.success);
         assert!(!ctrl_resp.error_message.is_empty());
+    }
+
+    fn auth_req<T>(payload: T, session_token: &str) -> Request<T> {
+        let mut req = Request::new(payload);
+        req.metadata_mut().insert(
+            crate::auth::AUTH_HEADER,
+            MetadataValue::from_str(session_token).unwrap(),
+        );
+        req
+    }
+
+    #[tokio::test]
+    async fn test_managed_services_rpcs_auth_and_lifecycle() {
+        use ntx_proto::ManagedServiceConfig;
+        use tokio_stream::StreamExt;
+
+        let psk = "test_key_managed";
+        let mut config = Config::default();
+        config.server.psk = psk.to_string();
+
+        let auth = AuthManager::new(psk, 3600);
+        let service = NtxAgentService::new(config, auth);
+
+        // 1. All 6 Managed Services RPCs reject unauthenticated requests.
+        assert!(service
+            .list_managed_services(Request::new(ListManagedServicesRequest {}))
+            .await
+            .is_err());
+        assert!(service
+            .save_managed_service(Request::new(SaveManagedServiceRequest { config: None }))
+            .await
+            .is_err());
+        assert!(service
+            .delete_managed_service(Request::new(DeleteManagedServiceRequest {
+                id: "svc1".to_string(),
+            }))
+            .await
+            .is_err());
+        assert!(service
+            .control_managed_service(Request::new(ControlManagedServiceRequest {
+                id: "svc1".to_string(),
+                action: "start".to_string(),
+            }))
+            .await
+            .is_err());
+        assert!(service
+            .send_managed_service_input(Request::new(SendManagedServiceInputRequest {
+                id: "svc1".to_string(),
+                input: "list".to_string(),
+                append_newline: true,
+            }))
+            .await
+            .is_err());
+        assert!(service
+            .stream_managed_service_console(Request::new(StreamManagedServiceConsoleRequest {
+                id: "svc1".to_string(),
+                tail_lines: 50,
+            }))
+            .await
+            .is_err());
+
+        let token = authenticate_service(&service, psk, "viewer-ms").await;
+
+        // Missing config -> graceful failure response.
+        let missing_resp = service
+            .save_managed_service(auth_req(SaveManagedServiceRequest { config: None }, &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!missing_resp.success);
+        assert!(!missing_resp.error_message.is_empty());
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "ntx_srv_test_ms_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        #[cfg(unix)]
+        let cmd =
+            r#"echo READY; while IFS= read -r line; do echo "ECHO:$line"; [ "$line" = "quit" ] && exit 0; done"#
+                .to_string();
+        #[cfg(windows)]
+        let cmd = {
+            let script = temp_dir.join("srv_echo.cmd");
+            std::fs::write(
+                &script,
+                "@echo off\r\necho READY\r\n:loop\r\nset \"line=\"\r\nset /p \"line=\"\r\necho ECHO:%line%\r\nif \"%line%\"==\"quit\" exit /b 0\r\ngoto loop\r\n",
+            )
+            .unwrap();
+            script.to_string_lossy().to_string()
+        };
+
+        let cfg = ManagedServiceConfig {
+            id: "srv-echo".to_string(),
+            name: "Server Echo".to_string(),
+            icon: "⚙".to_string(),
+            description: "Test RPC".to_string(),
+            command: cmd,
+            working_dir: temp_dir.to_string_lossy().to_string(),
+            stop_command: "quit".to_string(),
+            auto_start: false,
+            auto_restart: false,
+            env_vars: vec![],
+            quick_commands: vec!["status".to_string()],
+            systemd_unit: String::new(),
+            attach_command: String::new(),
+        };
+
+        // 2. Save -> List -> Stream -> Start -> Input -> Stop -> Delete.
+        let save_resp = service
+            .save_managed_service(auth_req(
+                SaveManagedServiceRequest { config: Some(cfg) },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(save_resp.success, "save failed: {}", save_resp.error_message);
+        assert_eq!(save_resp.service.unwrap().id, "srv-echo");
+
+        let list_resp = service
+            .list_managed_services(auth_req(ListManagedServicesRequest {}, &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(list_resp.services.len(), 1);
+        assert_eq!(list_resp.services[0].state, "stopped");
+
+        let mut console_stream = service
+            .stream_managed_service_console(auth_req(
+                StreamManagedServiceConsoleRequest {
+                    id: "srv-echo".to_string(),
+                    tail_lines: 50,
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let start_resp = service
+            .control_managed_service(auth_req(
+                ControlManagedServiceRequest {
+                    id: "srv-echo".to_string(),
+                    action: "start".to_string(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(start_resp.success, "start failed: {}", start_resp.error_message);
+
+        let mut output = String::new();
+        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !output.contains("READY") {
+            let rem = ready_deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!rem.is_zero(), "Timed out waiting for READY; got: {:?}", output);
+            let chunk = tokio::time::timeout(rem, console_stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            output.push_str(&String::from_utf8_lossy(&chunk.data));
+        }
+
+        let input_resp = service
+            .send_managed_service_input(auth_req(
+                SendManagedServiceInputRequest {
+                    id: "srv-echo".to_string(),
+                    input: "ping_srv".to_string(),
+                    append_newline: true,
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(input_resp.success, "send_input failed: {}", input_resp.error_message);
+
+        let echo_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !output.contains("ECHO:ping_srv") {
+            let rem = echo_deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !rem.is_zero(),
+                "Timed out waiting for ECHO:ping_srv; got: {:?}",
+                output
+            );
+            let chunk = tokio::time::timeout(rem, console_stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            output.push_str(&String::from_utf8_lossy(&chunk.data));
+        }
+
+        let stop_resp = service
+            .control_managed_service(auth_req(
+                ControlManagedServiceRequest {
+                    id: "srv-echo".to_string(),
+                    action: "stop".to_string(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(stop_resp.success);
+
+        let del_resp = service
+            .delete_managed_service(auth_req(
+                DeleteManagedServiceRequest {
+                    id: "srv-echo".to_string(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(del_resp.success);
+
+        let list_after = service
+            .list_managed_services(auth_req(ListManagedServicesRequest {}, &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(list_after.services.is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_docker_rpcs_auth_and_validation() {
+        let psk = "test_key_docker";
+        let mut config = Config::default();
+        config.server.psk = psk.to_string();
+
+        let auth = AuthManager::new(psk, 3600);
+        let service = NtxAgentService::new(config, auth);
+
+        // Unauthenticated requests must be rejected.
+        assert!(service
+            .list_docker_containers(Request::new(ListDockerContainersRequest {
+                include_all: true,
+            }))
+            .await
+            .is_err());
+        assert!(service
+            .control_docker_container(Request::new(ControlDockerContainerRequest {
+                container_id: "abc123def456".to_string(),
+                action: "restart".to_string(),
+                force: false,
+            }))
+            .await
+            .is_err());
+        assert!(service
+            .exec_docker_command(Request::new(ExecDockerCommandRequest {
+                container_id: "abc123def456".to_string(),
+                command: "echo hi".to_string(),
+            }))
+            .await
+            .is_err());
+
+        let token = authenticate_service(&service, psk, "viewer-docker").await;
+
+        // ListDockerContainers succeeds cleanly whether Docker is installed or not.
+        let list_resp = service
+            .list_docker_containers(auth_req(
+                ListDockerContainersRequest { include_all: true },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        if !list_resp.docker_available {
+            assert!(!list_resp.error_message.is_empty());
+        }
+
+        // ControlDockerContainer rejects invalid container ID and disallowed actions.
+        let bad_id_resp = service
+            .control_docker_container(auth_req(
+                ControlDockerContainerRequest {
+                    container_id: "--privileged".to_string(),
+                    action: "start".to_string(),
+                    force: false,
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!bad_id_resp.success);
+        assert!(!bad_id_resp.error_message.is_empty());
+
+        let bad_act_resp = service
+            .control_docker_container(auth_req(
+                ControlDockerContainerRequest {
+                    container_id: "valid-container".to_string(),
+                    action: "prune".to_string(),
+                    force: false,
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!bad_act_resp.success);
+        assert!(!bad_act_resp.error_message.is_empty());
+
+        // ExecDockerCommand rejects bad container ID and empty command.
+        let bad_exec_id = service
+            .exec_docker_command(auth_req(
+                ExecDockerCommandRequest {
+                    container_id: "bad;id".to_string(),
+                    command: "ls".to_string(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!bad_exec_id.success);
+        assert!(!bad_exec_id.error_message.is_empty());
+
+        let bad_exec_cmd = service
+            .exec_docker_command(auth_req(
+                ExecDockerCommandRequest {
+                    container_id: "valid-container".to_string(),
+                    command: "   ".to_string(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!bad_exec_cmd.success);
+        assert!(!bad_exec_cmd.error_message.is_empty());
     }
 }

@@ -1,19 +1,21 @@
-use crate::client::{ClientConnectError, NtxClient};
+use crate::client::{is_unimplemented_error, ClientConnectError, NtxClient};
 use crate::discovery::{start_discovery, DiscoveredDevice, DiscoveryEvent, DiscoveryHandle};
 use crate::state::{
-    AppSettings, ConnectionStatus, Device, KnownDevice, ManualDevice, TerminalSessionState,
+    favorite_app_to_managed_config, AppSettings, ConnectionStatus, ConsoleStreamState, Device,
+    DockerConsoleMode, KnownDevice, ManualDevice, TerminalSessionState,
 };
 use crate::ui::device_panel::{self, DevicePanelAction, DevicePanelState, DeviceTab};
-use crate::ui::favorites_panel::FavoritesPanelAction;
-use crate::ui::overview::{self, OverviewAction};
+use crate::ui::docker_panel::DockerPanelAction;
+use crate::ui::overview::{self, OverviewAction, OverviewState};
 use crate::ui::process_panel::ProcessPanelAction;
+use crate::ui::services_panel::ServicesPanelAction;
 use crate::ui::settings::{self, SettingsAction, SettingsState};
 use crate::ui::sidebar::{self, SidebarAction, SidebarState};
 use crate::ui::terminal::TerminalAction;
 use crate::ui::theme::{self, Palette};
 use ntx_proto::terminal_input::Input;
 use ntx_proto::{SystemInfo, SystemMetrics, TerminalInput, TerminalResize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -107,6 +109,114 @@ pub enum AppEvent {
         success: bool,
         error: String,
     },
+    ManagedServicesReceived {
+        device_id: String,
+        generation: u64,
+        services: Vec<ntx_proto::ManagedServiceStatus>,
+    },
+    ManagedServicesFailed {
+        device_id: String,
+        generation: u64,
+        error: String,
+        is_unimplemented: bool,
+    },
+    ManagedServiceSaved {
+        device_id: String,
+        generation: u64,
+        service_name: String,
+        service_id: Option<String>,
+        success: bool,
+        error: String,
+        is_unimplemented: bool,
+    },
+    ManagedServiceDeleted {
+        device_id: String,
+        generation: u64,
+        service_id: String,
+        success: bool,
+        error: String,
+    },
+    ManagedServiceControlled {
+        device_id: String,
+        generation: u64,
+        service_id: String,
+        action: String,
+        success: bool,
+        error: String,
+    },
+    ManagedServiceInputSent {
+        device_id: String,
+        generation: u64,
+        service_id: String,
+        success: bool,
+        error: String,
+    },
+    ServiceConsoleReady {
+        device_id: String,
+        service_id: String,
+        generation: u64,
+    },
+    ServiceConsoleChunk {
+        device_id: String,
+        service_id: String,
+        generation: u64,
+        data: Vec<u8>,
+        is_history: bool,
+    },
+    ServiceConsoleClosed {
+        device_id: String,
+        service_id: String,
+        generation: u64,
+        error: Option<String>,
+    },
+    DockerContainersReceived {
+        device_id: String,
+        generation: u64,
+        response: Box<ntx_proto::ListDockerContainersResponse>,
+    },
+    DockerContainersFailed {
+        device_id: String,
+        generation: u64,
+        error: String,
+        is_unimplemented: bool,
+    },
+    DockerContainerControlled {
+        device_id: String,
+        generation: u64,
+        container_id: String,
+        action: String,
+        success: bool,
+        error: String,
+    },
+    DockerCommandExecuted {
+        device_id: String,
+        generation: u64,
+        container_id: String,
+        command: String,
+        success: bool,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+        error: String,
+    },
+    DockerConsoleReady {
+        device_id: String,
+        container_id: String,
+        generation: u64,
+    },
+    DockerConsoleChunk {
+        device_id: String,
+        container_id: String,
+        generation: u64,
+        data: Vec<u8>,
+        is_history: bool,
+    },
+    DockerConsoleClosed {
+        device_id: String,
+        container_id: String,
+        generation: u64,
+        error: Option<String>,
+    },
 }
 
 pub struct NtxApp {
@@ -115,11 +225,17 @@ pub struct NtxApp {
     active_view: ActiveView,
     selected_device_id: Option<String>,
     device_panel_state: DevicePanelState,
+    overview_state: OverviewState,
     sidebar_state: SidebarState,
     devices: HashMap<String, Device>,
     active_clients: HashMap<String, NtxClient>,
     connection_gens: HashMap<String, u64>,
     terminal_gens: HashMap<String, u64>,
+    service_console_gens: HashMap<String, u64>,
+    service_console_cancel_txs: HashMap<String, oneshot::Sender<()>>,
+    docker_console_gens: HashMap<String, u64>,
+    docker_console_cancel_txs: HashMap<String, oneshot::Sender<()>>,
+    docker_console_input_txs: HashMap<String, mpsc::Sender<ntx_proto::DockerConsoleInput>>,
     settings: AppSettings,
     settings_state: SettingsState,
     settings_warning: Option<String>,
@@ -138,7 +254,7 @@ impl NtxApp {
 
         let egui_ctx = cc.egui_ctx.clone();
         let (disc_tx, disc_rx) = mpsc::channel(64);
-        let (event_tx, event_rx) = mpsc::channel(256);
+        let (event_tx, event_rx) = mpsc::channel(512);
 
         let discovery_handle =
             match start_discovery(disc_tx, rt.handle().clone(), Some(egui_ctx.clone())) {
@@ -158,11 +274,17 @@ impl NtxApp {
             active_view: ActiveView::Overview,
             selected_device_id: None,
             device_panel_state: DevicePanelState::default(),
+            overview_state: OverviewState::default(),
             sidebar_state: SidebarState::new(),
             devices: HashMap::new(),
             active_clients: HashMap::new(),
             connection_gens: HashMap::new(),
             terminal_gens: HashMap::new(),
+            service_console_gens: HashMap::new(),
+            service_console_cancel_txs: HashMap::new(),
+            docker_console_gens: HashMap::new(),
+            docker_console_cancel_txs: HashMap::new(),
+            docker_console_input_txs: HashMap::new(),
             settings,
             settings_state: SettingsState::default(),
             settings_warning,
@@ -238,40 +360,57 @@ impl NtxApp {
 
     fn select_device(&mut self, id: Option<String>) {
         self.selected_device_id = id.clone();
-        self.device_panel_state.favorites_state.show_add_modal = false;
-        self.device_panel_state.favorites_state.pending_confirm = None;
-        self.device_panel_state.favorites_state.reset_form();
 
         if let Some(ref dev_id) = id {
-            let (should_fetch_proc, should_fetch_srv) =
-                if let Some(dev) = self.devices.get(dev_id) {
-                    self.device_panel_state.sync_from_device(dev);
-                    let on_proc_or_fav = matches!(
-                        self.device_panel_state.active_tab,
-                        DeviceTab::Processes | DeviceTab::Favorites
-                    );
-                    let fetch_proc = on_proc_or_fav
-                        && dev.status.is_connected()
-                        && dev.process_state.processes.is_empty()
-                        && !dev.process_state.is_loading_processes;
-                    let fetch_srv = on_proc_or_fav
-                        && dev.status.is_connected()
-                        && dev.process_state.services.is_empty()
-                        && !dev.process_state.is_loading_services;
-                    (fetch_proc, fetch_srv)
-                } else {
-                    (false, false)
-                };
-
-            if should_fetch_proc {
-                self.fetch_processes(dev_id);
+            if let Some(dev) = self.devices.get(dev_id) {
+                self.device_panel_state.sync_from_device(dev);
             }
-            if should_fetch_srv {
-                self.fetch_services(dev_id);
-            }
+            self.maybe_auto_load_active_tab(dev_id);
         } else {
             self.device_panel_state.edit_device_id = None;
             self.device_panel_state.psk_input.clear();
+            self.device_panel_state.services_state.reset_for_device();
+            self.device_panel_state.docker_state.reset_for_device();
+        }
+    }
+
+    fn maybe_auto_load_active_tab(&mut self, device_id: &str) {
+        let Some(dev) = self.devices.get(device_id) else {
+            return;
+        };
+        if !dev.status.is_connected() {
+            return;
+        }
+        match self.device_panel_state.active_tab {
+            DeviceTab::System => {
+                let need_proc = dev.process_state.processes.is_empty()
+                    && !dev.process_state.is_loading_processes;
+                let need_srv = dev.process_state.services.is_empty()
+                    && !dev.process_state.is_loading_services;
+                if need_proc {
+                    self.fetch_processes(device_id);
+                }
+                if need_srv {
+                    self.fetch_services(device_id);
+                }
+            }
+            DeviceTab::Services => {
+                let should_fetch = !dev.managed_services.unsupported_by_server
+                    && !dev.managed_services.is_loading;
+                if should_fetch {
+                    self.fetch_managed_services(device_id);
+                }
+            }
+            DeviceTab::Docker => {
+                let should_fetch = !dev.docker_state.unsupported_by_server
+                    && dev.docker_state.docker_available
+                    && !dev.docker_state.is_loading;
+                let include_all = dev.docker_state.include_all;
+                if should_fetch {
+                    self.fetch_docker_containers(device_id, include_all);
+                }
+            }
+            DeviceTab::Metrics | DeviceTab::Terminal | DeviceTab::Config => {}
         }
     }
 
@@ -437,6 +576,39 @@ impl NtxApp {
         *entry
     }
 
+    fn next_service_console_gen(&mut self, device_id: &str) -> u64 {
+        let entry = self
+            .service_console_gens
+            .entry(device_id.to_string())
+            .or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    fn next_docker_console_gen(&mut self, device_id: &str) -> u64 {
+        let entry = self
+            .docker_console_gens
+            .entry(device_id.to_string())
+            .or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    fn cancel_service_console(&mut self, device_id: &str) {
+        let _ = self.next_service_console_gen(device_id);
+        if let Some(cancel) = self.service_console_cancel_txs.remove(device_id) {
+            let _ = cancel.send(());
+        }
+    }
+
+    fn cancel_docker_console(&mut self, device_id: &str) {
+        let _ = self.next_docker_console_gen(device_id);
+        if let Some(cancel) = self.docker_console_cancel_txs.remove(device_id) {
+            let _ = cancel.send(());
+        }
+        self.docker_console_input_txs.remove(device_id);
+    }
+
     fn initiate_connect(&mut self, device_id: &str, explicit_psk: Option<String>) {
         if let Some(p) = explicit_psk {
             let trimmed = p.trim().to_string();
@@ -464,6 +636,8 @@ impl NtxApp {
 
         let gen = self.next_connection_gen(device_id);
         let _ = self.next_terminal_gen(device_id);
+        self.cancel_service_console(device_id);
+        self.cancel_docker_console(device_id);
         self.active_clients.remove(device_id);
         self.terminal_txs.remove(device_id);
         if let Some(old_tx) = self.metrics_cancel_txs.remove(device_id) {
@@ -482,6 +656,8 @@ impl NtxApp {
                 }
                 d.status = ConnectionStatus::Connecting;
                 d.terminal_state = TerminalSessionState::Idle;
+                d.managed_services.reset_on_disconnect();
+                d.docker_state.reset_on_disconnect();
                 (eps, d.cert_fingerprint.clone())
             }
             None => return,
@@ -669,6 +845,8 @@ impl NtxApp {
     fn disconnect_device(&mut self, device_id: &str) {
         let _ = self.next_connection_gen(device_id);
         let _ = self.next_terminal_gen(device_id);
+        self.cancel_service_console(device_id);
+        self.cancel_docker_console(device_id);
 
         if let Some(cancel) = self.metrics_cancel_txs.remove(device_id) {
             let _ = cancel.send(());
@@ -683,6 +861,8 @@ impl NtxApp {
             dev.pending_terminal_command = None;
             dev.process_state.is_loading_processes = false;
             dev.process_state.is_loading_services = false;
+            dev.managed_services.reset_on_disconnect();
+            dev.docker_state.reset_on_disconnect();
         }
     }
 
@@ -749,23 +929,6 @@ impl NtxApp {
                 self.open_terminal_session(device_id);
             }
         }
-    }
-
-    fn add_favorite_unique(&mut self, device_id: &str, fav: crate::state::FavoriteApp) {
-        if let Some(dev) = self.devices.get_mut(device_id) {
-            let already = dev.favorites.iter().any(|f| {
-                (!fav.process_filter.is_empty() && f.process_filter == fav.process_filter)
-                    || (fav.service_name.is_some() && f.service_name == fav.service_name)
-            });
-            if !already {
-                dev.favorites.push(fav);
-                self.settings
-                    .favorite_apps
-                    .insert(device_id.to_string(), dev.favorites.clone());
-                let _ = self.settings.save();
-            }
-        }
-        self.device_panel_state.active_tab = DeviceTab::Favorites;
     }
 
     fn open_terminal_session(&mut self, device_id: &str) {
@@ -1029,6 +1192,748 @@ impl NtxApp {
         });
     }
 
+    fn fetch_managed_services(&mut self, device_id: &str) {
+        let Some(mut client) = self.active_clients.get(device_id).cloned() else {
+            return;
+        };
+        let gen = *self.connection_gens.get(device_id).unwrap_or(&0);
+
+        if let Some(dev) = self.devices.get_mut(device_id) {
+            if dev.managed_services.is_loading {
+                return;
+            }
+            dev.managed_services.is_loading = true;
+            dev.managed_services.last_refresh = Some(std::time::Instant::now());
+        }
+
+        let dev_id = device_id.to_string();
+        let event_tx = self.event_tx.clone();
+        let ctx = self.egui_ctx.clone();
+
+        self.rt.spawn(async move {
+            match client.list_managed_services().await {
+                Ok(services) => {
+                    let _ = event_tx
+                        .send(AppEvent::ManagedServicesReceived {
+                            device_id: dev_id,
+                            generation: gen,
+                            services,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let is_unimplemented = is_unimplemented_error(&e);
+                    let _ = event_tx
+                        .send(AppEvent::ManagedServicesFailed {
+                            device_id: dev_id,
+                            generation: gen,
+                            error: format!("{e:#}"),
+                            is_unimplemented,
+                        })
+                        .await;
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn save_managed_service(&mut self, device_id: &str, config: ntx_proto::ManagedServiceConfig) {
+        let Some(mut client) = self.active_clients.get(device_id).cloned() else {
+            if let Some(dev) = self.devices.get_mut(device_id) {
+                dev.managed_services
+                    .set_status("Serveur non connecté.", true);
+            }
+            return;
+        };
+        let gen = *self.connection_gens.get(device_id).unwrap_or(&0);
+        let dev_id = device_id.to_string();
+        let svc_name = config.name.clone();
+        let event_tx = self.event_tx.clone();
+        let ctx = self.egui_ctx.clone();
+
+        self.rt.spawn(async move {
+            match client.save_managed_service(config).await {
+                Ok(resp) => {
+                    let _ = event_tx
+                        .send(AppEvent::ManagedServiceSaved {
+                            device_id: dev_id,
+                            generation: gen,
+                            service_name: svc_name,
+                            service_id: resp.service.map(|s| s.id),
+                            success: resp.success,
+                            error: resp.error_message,
+                            is_unimplemented: false,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let is_unimplemented = is_unimplemented_error(&e);
+                    let _ = event_tx
+                        .send(AppEvent::ManagedServiceSaved {
+                            device_id: dev_id,
+                            generation: gen,
+                            service_name: svc_name,
+                            service_id: None,
+                            success: false,
+                            error: format!("{e:#}"),
+                            is_unimplemented,
+                        })
+                        .await;
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn import_legacy_favorites(&mut self, device_id: &str) {
+        let Some(mut client) = self.active_clients.get(device_id).cloned() else {
+            if let Some(dev) = self.devices.get_mut(device_id) {
+                dev.managed_services
+                    .set_status("Serveur non connecté.", true);
+            }
+            return;
+        };
+        let gen = *self.connection_gens.get(device_id).unwrap_or(&0);
+
+        let configs: Vec<ntx_proto::ManagedServiceConfig> = {
+            let Some(dev) = self.devices.get(device_id) else {
+                return;
+            };
+            let mut existing_names: HashSet<String> = dev
+                .managed_services
+                .services
+                .iter()
+                .filter_map(|s| s.config.as_ref())
+                .map(|c| c.name.trim().to_lowercase())
+                .collect();
+            let mut existing_ids: HashSet<String> = dev
+                .managed_services
+                .services
+                .iter()
+                .filter_map(|s| s.config.as_ref())
+                .map(|c| c.id.trim().to_lowercase())
+                .collect();
+
+            let mut out = Vec::new();
+            for fav in &dev.favorites {
+                let mut cfg = favorite_app_to_managed_config(fav);
+                let name_key = cfg.name.trim().to_lowercase();
+                if existing_names.contains(&name_key) {
+                    continue;
+                }
+                if !cfg.id.is_empty() && existing_ids.contains(&cfg.id.to_lowercase()) {
+                    cfg.id.clear();
+                }
+                existing_names.insert(name_key);
+                if !cfg.id.is_empty() {
+                    existing_ids.insert(cfg.id.to_lowercase());
+                }
+                out.push(cfg);
+            }
+            out
+        };
+
+        if configs.is_empty() {
+            if let Some(dev) = self.devices.get_mut(device_id) {
+                dev.managed_services.set_status(
+                    "Tous les anciens favoris sont déjà présents dans Mes Services.",
+                    false,
+                );
+            }
+            return;
+        }
+
+        let dev_id = device_id.to_string();
+        let event_tx = self.event_tx.clone();
+        let ctx = self.egui_ctx.clone();
+
+        self.rt.spawn(async move {
+            let mut imported = 0usize;
+            let mut last_id = None;
+            let mut last_err = String::new();
+            let mut is_unimplemented = false;
+
+            for cfg in configs {
+                match client.save_managed_service(cfg).await {
+                    Ok(resp) if resp.success => {
+                        imported += 1;
+                        if let Some(svc) = resp.service {
+                            last_id = Some(svc.id);
+                        }
+                    }
+                    Ok(resp) => {
+                        last_err = resp.error_message;
+                    }
+                    Err(e) => {
+                        is_unimplemented = is_unimplemented_error(&e);
+                        last_err = format!("{e:#}");
+                        if is_unimplemented {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let _ = event_tx
+                .send(AppEvent::ManagedServiceSaved {
+                    device_id: dev_id,
+                    generation: gen,
+                    service_name: format!("{imported} service(s) importé(s)"),
+                    service_id: last_id,
+                    success: imported > 0,
+                    error: last_err,
+                    is_unimplemented,
+                })
+                .await;
+            ctx.request_repaint();
+        });
+    }
+
+    fn delete_managed_service(&mut self, device_id: &str, service_id: &str) {
+        let Some(mut client) = self.active_clients.get(device_id).cloned() else {
+            if let Some(dev) = self.devices.get_mut(device_id) {
+                dev.managed_services
+                    .set_status("Serveur non connecté.", true);
+            }
+            return;
+        };
+
+        if let Some(dev) = self.devices.get_mut(device_id) {
+            if dev.managed_services.console_service_id.as_deref() == Some(service_id) {
+                dev.managed_services.console_service_id = None;
+                dev.managed_services.console_state = ConsoleStreamState::Idle;
+                dev.managed_services.console_buffer.clear();
+                self.cancel_service_console(device_id);
+            }
+        }
+
+        let gen = *self.connection_gens.get(device_id).unwrap_or(&0);
+        let dev_id = device_id.to_string();
+        let svc_id = service_id.to_string();
+        let event_tx = self.event_tx.clone();
+        let ctx = self.egui_ctx.clone();
+
+        self.rt.spawn(async move {
+            match client.delete_managed_service(&svc_id).await {
+                Ok(resp) => {
+                    let _ = event_tx
+                        .send(AppEvent::ManagedServiceDeleted {
+                            device_id: dev_id,
+                            generation: gen,
+                            service_id: svc_id,
+                            success: resp.success,
+                            error: resp.error_message,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = event_tx
+                        .send(AppEvent::ManagedServiceDeleted {
+                            device_id: dev_id,
+                            generation: gen,
+                            service_id: svc_id,
+                            success: false,
+                            error: format!("{e:#}"),
+                        })
+                        .await;
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn control_managed_service(&mut self, device_id: &str, service_id: &str, action: &str) {
+        let Some(mut client) = self.active_clients.get(device_id).cloned() else {
+            if let Some(dev) = self.devices.get_mut(device_id) {
+                dev.managed_services
+                    .set_status("Serveur non connecté.", true);
+            }
+            return;
+        };
+        let gen = *self.connection_gens.get(device_id).unwrap_or(&0);
+        let dev_id = device_id.to_string();
+        let svc_id = service_id.to_string();
+        let act = action.to_string();
+        let event_tx = self.event_tx.clone();
+        let ctx = self.egui_ctx.clone();
+
+        self.rt.spawn(async move {
+            match client.control_managed_service(&svc_id, &act).await {
+                Ok(resp) => {
+                    let _ = event_tx
+                        .send(AppEvent::ManagedServiceControlled {
+                            device_id: dev_id,
+                            generation: gen,
+                            service_id: svc_id,
+                            action: act,
+                            success: resp.success,
+                            error: resp.error_message,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = event_tx
+                        .send(AppEvent::ManagedServiceControlled {
+                            device_id: dev_id,
+                            generation: gen,
+                            service_id: svc_id,
+                            action: act,
+                            success: false,
+                            error: format!("{e:#}"),
+                        })
+                        .await;
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn send_managed_service_input(&mut self, device_id: &str, service_id: &str, input: &str) {
+        let Some(mut client) = self.active_clients.get(device_id).cloned() else {
+            if let Some(dev) = self.devices.get_mut(device_id) {
+                dev.managed_services
+                    .set_status("Serveur non connecté.", true);
+            }
+            return;
+        };
+        let gen = *self.connection_gens.get(device_id).unwrap_or(&0);
+        let dev_id = device_id.to_string();
+        let svc_id = service_id.to_string();
+        let payload = input.to_string();
+        let event_tx = self.event_tx.clone();
+        let ctx = self.egui_ctx.clone();
+
+        if let Some(dev) = self.devices.get_mut(device_id) {
+            if dev.managed_services.console_service_id.as_deref() == Some(service_id) {
+                dev.managed_services.console_buffer.push_system_line(
+                    &format!("> {payload}"),
+                    Some(Palette::dark().accent),
+                );
+            }
+        }
+
+        self.rt.spawn(async move {
+            match client
+                .send_managed_service_input(&svc_id, &payload, true)
+                .await
+            {
+                Ok(resp) => {
+                    let _ = event_tx
+                        .send(AppEvent::ManagedServiceInputSent {
+                            device_id: dev_id,
+                            generation: gen,
+                            service_id: svc_id,
+                            success: resp.success,
+                            error: resp.error_message,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = event_tx
+                        .send(AppEvent::ManagedServiceInputSent {
+                            device_id: dev_id,
+                            generation: gen,
+                            service_id: svc_id,
+                            success: false,
+                            error: format!("{e:#}"),
+                        })
+                        .await;
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn open_service_console(&mut self, device_id: &str, service_id: &str) {
+        let Some(mut client) = self.active_clients.get(device_id).cloned() else {
+            return;
+        };
+
+        let gen = self.next_service_console_gen(device_id);
+        if let Some(old_cancel) = self.service_console_cancel_txs.remove(device_id) {
+            let _ = old_cancel.send(());
+        }
+
+        if let Some(dev) = self.devices.get_mut(device_id) {
+            dev.managed_services.console_service_id = Some(service_id.to_string());
+            dev.managed_services.console_state = ConsoleStreamState::Connecting;
+            dev.managed_services.console_buffer.clear();
+        } else {
+            return;
+        }
+
+        let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+        self.service_console_cancel_txs
+            .insert(device_id.to_string(), cancel_tx);
+
+        let dev_id = device_id.to_string();
+        let svc_id = service_id.to_string();
+        let event_tx = self.event_tx.clone();
+        let ctx = self.egui_ctx.clone();
+
+        self.rt.spawn(async move {
+            let mut stream = match client.stream_managed_service_console(&svc_id, 200).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = event_tx
+                        .send(AppEvent::ServiceConsoleClosed {
+                            device_id: dev_id,
+                            service_id: svc_id,
+                            generation: gen,
+                            error: Some(format!("{e:#}")),
+                        })
+                        .await;
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+
+            let _ = event_tx
+                .send(AppEvent::ServiceConsoleReady {
+                    device_id: dev_id.clone(),
+                    service_id: svc_id.clone(),
+                    generation: gen,
+                })
+                .await;
+            ctx.request_repaint();
+
+            let mut was_cancelled = false;
+            let mut closed_err = None;
+            loop {
+                tokio::select! {
+                    _ = &mut cancel_rx => {
+                        was_cancelled = true;
+                        break;
+                    }
+                    item = stream.message() => {
+                        match item {
+                            Ok(Some(chunk)) => {
+                                if !chunk.data.is_empty() {
+                                    if event_tx
+                                        .send(AppEvent::ServiceConsoleChunk {
+                                            device_id: dev_id.clone(),
+                                            service_id: svc_id.clone(),
+                                            generation: gen,
+                                            data: chunk.data,
+                                            is_history: chunk.is_history,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        was_cancelled = true;
+                                        break;
+                                    }
+                                    ctx.request_repaint();
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(status) => {
+                                closed_err = Some(status.message().to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !was_cancelled {
+                let _ = event_tx
+                    .send(AppEvent::ServiceConsoleClosed {
+                        device_id: dev_id,
+                        service_id: svc_id,
+                        generation: gen,
+                        error: closed_err,
+                    })
+                    .await;
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn fetch_docker_containers(&mut self, device_id: &str, include_all: bool) {
+        let Some(mut client) = self.active_clients.get(device_id).cloned() else {
+            return;
+        };
+        let gen = *self.connection_gens.get(device_id).unwrap_or(&0);
+
+        if let Some(dev) = self.devices.get_mut(device_id) {
+            if dev.docker_state.is_loading {
+                return;
+            }
+            dev.docker_state.is_loading = true;
+            dev.docker_state.include_all = include_all;
+            dev.docker_state.last_refresh = Some(std::time::Instant::now());
+        }
+
+        let dev_id = device_id.to_string();
+        let event_tx = self.event_tx.clone();
+        let ctx = self.egui_ctx.clone();
+
+        self.rt.spawn(async move {
+            match client.list_docker_containers(include_all).await {
+                Ok(response) => {
+                    let _ = event_tx
+                        .send(AppEvent::DockerContainersReceived {
+                            device_id: dev_id,
+                            generation: gen,
+                            response: Box::new(response),
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let is_unimplemented = is_unimplemented_error(&e);
+                    let _ = event_tx
+                        .send(AppEvent::DockerContainersFailed {
+                            device_id: dev_id,
+                            generation: gen,
+                            error: format!("{e:#}"),
+                            is_unimplemented,
+                        })
+                        .await;
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn control_docker_container(
+        &mut self,
+        device_id: &str,
+        container_id: &str,
+        action: &str,
+        force: bool,
+    ) {
+        let Some(mut client) = self.active_clients.get(device_id).cloned() else {
+            if let Some(dev) = self.devices.get_mut(device_id) {
+                dev.docker_state.set_status("Serveur non connecté.", true);
+            }
+            return;
+        };
+        let gen = *self.connection_gens.get(device_id).unwrap_or(&0);
+        let dev_id = device_id.to_string();
+        let cid = container_id.to_string();
+        let act = action.to_string();
+        let event_tx = self.event_tx.clone();
+        let ctx = self.egui_ctx.clone();
+
+        self.rt.spawn(async move {
+            match client.control_docker_container(&cid, &act, force).await {
+                Ok(resp) => {
+                    let _ = event_tx
+                        .send(AppEvent::DockerContainerControlled {
+                            device_id: dev_id,
+                            generation: gen,
+                            container_id: cid,
+                            action: act,
+                            success: resp.success,
+                            error: resp.error_message,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = event_tx
+                        .send(AppEvent::DockerContainerControlled {
+                            device_id: dev_id,
+                            generation: gen,
+                            container_id: cid,
+                            action: act,
+                            success: false,
+                            error: format!("{e:#}"),
+                        })
+                        .await;
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn exec_docker_command(&mut self, device_id: &str, container_id: &str, command: &str) {
+        let Some(mut client) = self.active_clients.get(device_id).cloned() else {
+            if let Some(dev) = self.devices.get_mut(device_id) {
+                dev.docker_state.set_status("Serveur non connecté.", true);
+            }
+            return;
+        };
+
+        if let Some(dev) = self.devices.get_mut(device_id) {
+            if dev.docker_state.console_container_id.as_deref() == Some(container_id) {
+                dev.docker_state.console_buffer.push_system_line(
+                    &format!("$ {command}"),
+                    Some(Palette::dark().accent),
+                );
+            }
+        }
+
+        let gen = *self.connection_gens.get(device_id).unwrap_or(&0);
+        let dev_id = device_id.to_string();
+        let cid = container_id.to_string();
+        let cmd = command.to_string();
+        let event_tx = self.event_tx.clone();
+        let ctx = self.egui_ctx.clone();
+
+        self.rt.spawn(async move {
+            match client.exec_docker_command(&cid, &cmd).await {
+                Ok(resp) => {
+                    let _ = event_tx
+                        .send(AppEvent::DockerCommandExecuted {
+                            device_id: dev_id,
+                            generation: gen,
+                            container_id: cid,
+                            command: cmd,
+                            success: resp.success,
+                            exit_code: resp.exit_code,
+                            stdout: resp.stdout,
+                            stderr: resp.stderr,
+                            error: resp.error_message,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = event_tx
+                        .send(AppEvent::DockerCommandExecuted {
+                            device_id: dev_id,
+                            generation: gen,
+                            container_id: cid,
+                            command: cmd,
+                            success: false,
+                            exit_code: -1,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            error: format!("{e:#}"),
+                        })
+                        .await;
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn open_docker_console(
+        &mut self,
+        device_id: &str,
+        container_id: &str,
+        mode: DockerConsoleMode,
+    ) {
+        let Some(mut client) = self.active_clients.get(device_id).cloned() else {
+            return;
+        };
+
+        let gen = self.next_docker_console_gen(device_id);
+        if let Some(old_cancel) = self.docker_console_cancel_txs.remove(device_id) {
+            let _ = old_cancel.send(());
+        }
+        self.docker_console_input_txs.remove(device_id);
+
+        if let Some(dev) = self.devices.get_mut(device_id) {
+            dev.docker_state.console_mode = mode;
+            dev.docker_state.console_container_id = Some(container_id.to_string());
+            dev.docker_state.console_state = ConsoleStreamState::Connecting;
+            dev.docker_state.console_buffer.clear();
+        } else {
+            return;
+        }
+
+        let (input_tx, input_rx) = mpsc::channel::<ntx_proto::DockerConsoleInput>(64);
+        let _ = input_tx.try_send(ntx_proto::DockerConsoleInput {
+            input: Some(ntx_proto::docker_console_input::Input::Init(
+                ntx_proto::DockerConsoleInit {
+                    container_id: container_id.to_string(),
+                    mode: mode.as_proto_mode().to_string(),
+                    tail_lines: 200,
+                },
+            )),
+        });
+        self.docker_console_input_txs
+            .insert(device_id.to_string(), input_tx);
+
+        let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+        self.docker_console_cancel_txs
+            .insert(device_id.to_string(), cancel_tx);
+
+        let dev_id = device_id.to_string();
+        let cid = container_id.to_string();
+        let event_tx = self.event_tx.clone();
+        let ctx = self.egui_ctx.clone();
+
+        self.rt.spawn(async move {
+            let mut stream = match client.stream_docker_console(input_rx).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = event_tx
+                        .send(AppEvent::DockerConsoleClosed {
+                            device_id: dev_id,
+                            container_id: cid,
+                            generation: gen,
+                            error: Some(format!("{e:#}")),
+                        })
+                        .await;
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+
+            let _ = event_tx
+                .send(AppEvent::DockerConsoleReady {
+                    device_id: dev_id.clone(),
+                    container_id: cid.clone(),
+                    generation: gen,
+                })
+                .await;
+            ctx.request_repaint();
+
+            let mut was_cancelled = false;
+            let mut closed_err = None;
+            loop {
+                tokio::select! {
+                    _ = &mut cancel_rx => {
+                        was_cancelled = true;
+                        break;
+                    }
+                    item = stream.message() => {
+                        match item {
+                            Ok(Some(chunk)) => {
+                                if !chunk.data.is_empty() {
+                                    if event_tx
+                                        .send(AppEvent::DockerConsoleChunk {
+                                            device_id: dev_id.clone(),
+                                            container_id: cid.clone(),
+                                            generation: gen,
+                                            data: chunk.data,
+                                            is_history: chunk.is_history,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        was_cancelled = true;
+                                        break;
+                                    }
+                                    ctx.request_repaint();
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(status) => {
+                                closed_err = Some(status.message().to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !was_cancelled {
+                let _ = event_tx
+                    .send(AppEvent::DockerConsoleClosed {
+                        device_id: dev_id,
+                        container_id: cid,
+                        generation: gen,
+                        error: closed_err,
+                    })
+                    .await;
+                ctx.request_repaint();
+            }
+        });
+    }
+
     fn poll_channels(&mut self) {
         while let Ok(event) = self.discovery_rx.try_recv() {
             match event {
@@ -1144,14 +2049,8 @@ impl NtxApp {
                     }
                     self.save_known_devices();
 
-                    if self.selected_device_id.as_deref() == Some(&device_id)
-                        && matches!(
-                            self.device_panel_state.active_tab,
-                            DeviceTab::Processes | DeviceTab::Favorites
-                        )
-                    {
-                        self.fetch_processes(&device_id);
-                        self.fetch_services(&device_id);
+                    if self.selected_device_id.as_deref() == Some(&device_id) {
+                        self.maybe_auto_load_active_tab(&device_id);
                     }
                 }
                 AppEvent::PingResult {
@@ -1287,9 +2186,13 @@ impl NtxApp {
                     if self.connection_gens.get(&device_id) != Some(&generation) {
                         continue;
                     }
+                    let _ = self.next_connection_gen(&device_id);
+                    let _ = self.next_terminal_gen(&device_id);
                     self.active_clients.remove(&device_id);
                     self.terminal_txs.remove(&device_id);
                     self.metrics_cancel_txs.remove(&device_id);
+                    self.cancel_service_console(&device_id);
+                    self.cancel_docker_console(&device_id);
                     if let Some(dev) = self.devices.get_mut(&device_id) {
                         if dev.status.is_connected() {
                             dev.status = ConnectionStatus::Disconnected;
@@ -1302,6 +2205,8 @@ impl NtxApp {
                         }
                         dev.process_state.is_loading_processes = false;
                         dev.process_state.is_loading_services = false;
+                        dev.managed_services.reset_on_disconnect();
+                        dev.docker_state.reset_on_disconnect();
                     }
                 }
                 AppEvent::ProcessesReceived {
@@ -1388,6 +2293,557 @@ impl NtxApp {
                     self.fetch_services(&device_id);
                     self.fetch_processes(&device_id);
                 }
+                AppEvent::ManagedServicesReceived {
+                    device_id,
+                    generation,
+                    services,
+                } => {
+                    if self.connection_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    let mut stream_to_open: Option<String> = None;
+                    let mut should_cancel_stream = false;
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        dev.managed_services.services = services;
+                        dev.managed_services.is_loading = false;
+                        dev.managed_services.unsupported_by_server = false;
+
+                        let still_exists = dev
+                            .managed_services
+                            .selected_service_id
+                            .as_deref()
+                            .is_some_and(|sel| {
+                                dev.managed_services.services.iter().any(|s| {
+                                    s.config.as_ref().is_some_and(|c| c.id == sel)
+                                })
+                            });
+                        if !still_exists {
+                            dev.managed_services.selected_service_id = dev
+                                .managed_services
+                                .services
+                                .first()
+                                .and_then(|s| s.config.as_ref())
+                                .map(|c| c.id.clone());
+                        }
+
+                        if let Some(sel_id) = dev.managed_services.selected_service_id.clone() {
+                            let same_stream = dev
+                                .managed_services
+                                .console_service_id
+                                .as_deref()
+                                == Some(sel_id.as_str());
+                            if !same_stream
+                                || dev.managed_services.console_state == ConsoleStreamState::Idle
+                            {
+                                stream_to_open = Some(sel_id);
+                            }
+                        } else {
+                            dev.managed_services.console_service_id = None;
+                            dev.managed_services.console_state = ConsoleStreamState::Idle;
+                            should_cancel_stream = true;
+                        }
+                    }
+                    if should_cancel_stream {
+                        self.cancel_service_console(&device_id);
+                    } else if let Some(svc_id) = stream_to_open {
+                        self.open_service_console(&device_id, &svc_id);
+                    }
+                }
+                AppEvent::ManagedServicesFailed {
+                    device_id,
+                    generation,
+                    error,
+                    is_unimplemented,
+                } => {
+                    if self.connection_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        dev.managed_services.is_loading = false;
+                        if is_unimplemented {
+                            dev.managed_services.unsupported_by_server = true;
+                        } else {
+                            dev.managed_services.set_status(
+                                format!(
+                                    "Erreur lors de la récupération des services gérés : {error}"
+                                ),
+                                true,
+                            );
+                        }
+                    }
+                }
+                AppEvent::ManagedServiceSaved {
+                    device_id,
+                    generation,
+                    service_name,
+                    service_id,
+                    success,
+                    error,
+                    is_unimplemented,
+                } => {
+                    if self.connection_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        if is_unimplemented {
+                            dev.managed_services.unsupported_by_server = true;
+                        } else if success {
+                            if let Some(saved_id) = service_id {
+                                dev.managed_services.selected_service_id = Some(saved_id);
+                            }
+                            dev.managed_services.set_status(
+                                format!("Service « {service_name} » enregistré."),
+                                false,
+                            );
+                        } else {
+                            dev.managed_services.set_status(
+                                format!(
+                                    "Échec de l'enregistrement de « {service_name} » : {error}"
+                                ),
+                                true,
+                            );
+                        }
+                    }
+                    if success {
+                        self.fetch_managed_services(&device_id);
+                    }
+                }
+                AppEvent::ManagedServiceDeleted {
+                    device_id,
+                    generation,
+                    service_id,
+                    success,
+                    error,
+                } => {
+                    if self.connection_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        if success {
+                            if dev.managed_services.selected_service_id.as_deref()
+                                == Some(service_id.as_str())
+                            {
+                                dev.managed_services.selected_service_id = None;
+                            }
+                            dev.managed_services
+                                .set_status("Service supprimé avec succès.", false);
+                        } else {
+                            dev.managed_services.set_status(
+                                format!("Échec de la suppression du service : {error}"),
+                                true,
+                            );
+                        }
+                    }
+                    if success {
+                        self.fetch_managed_services(&device_id);
+                    }
+                }
+                AppEvent::ManagedServiceControlled {
+                    device_id,
+                    generation,
+                    service_id,
+                    action,
+                    success,
+                    error,
+                } => {
+                    if self.connection_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    let mut reconnect_svc: Option<String> = None;
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        if success {
+                            dev.managed_services.set_status(
+                                format!("Action « {action} » appliquée avec succès."),
+                                false,
+                            );
+                            if matches!(action.as_str(), "start" | "restart")
+                                && dev.managed_services.selected_service_id.as_deref()
+                                    == Some(service_id.as_str())
+                                && !matches!(
+                                    dev.managed_services.console_state,
+                                    ConsoleStreamState::Streaming | ConsoleStreamState::Connecting
+                                )
+                            {
+                                reconnect_svc = Some(service_id.clone());
+                            }
+                        } else {
+                            dev.managed_services.set_status(
+                                format!("Échec de l'action « {action} » : {error}"),
+                                true,
+                            );
+                        }
+                    }
+                    if let Some(svc_id) = reconnect_svc {
+                        self.open_service_console(&device_id, &svc_id);
+                    }
+                    self.fetch_managed_services(&device_id);
+                }
+                AppEvent::ManagedServiceInputSent {
+                    device_id,
+                    generation,
+                    service_id,
+                    success,
+                    error,
+                } => {
+                    if self.connection_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    if !success {
+                        if let Some(dev) = self.devices.get_mut(&device_id) {
+                            let msg = format!("Échec de l'envoi de la commande : {error}");
+                            dev.managed_services.set_status(msg.clone(), true);
+                            if dev.managed_services.console_service_id.as_deref()
+                                == Some(service_id.as_str())
+                            {
+                                dev.managed_services
+                                    .console_buffer
+                                    .push_system_line(&format!("[{msg}]"), Some(Palette::dark().danger));
+                            }
+                        }
+                    }
+                }
+                AppEvent::ServiceConsoleReady {
+                    device_id,
+                    service_id,
+                    generation,
+                } => {
+                    if self.service_console_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        if dev.managed_services.console_service_id.as_deref()
+                            == Some(service_id.as_str())
+                        {
+                            dev.managed_services.console_state = ConsoleStreamState::Streaming;
+                        }
+                    }
+                }
+                AppEvent::ServiceConsoleChunk {
+                    device_id,
+                    service_id,
+                    generation,
+                    data,
+                    is_history: _,
+                } => {
+                    if self.service_console_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        if dev.managed_services.console_service_id.as_deref()
+                            == Some(service_id.as_str())
+                        {
+                            dev.managed_services.console_buffer.push_bytes(&data);
+                        }
+                    }
+                }
+                AppEvent::ServiceConsoleClosed {
+                    device_id,
+                    service_id,
+                    generation,
+                    error,
+                } => {
+                    if self.service_console_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    self.service_console_cancel_txs.remove(&device_id);
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        if dev.managed_services.console_service_id.as_deref()
+                            == Some(service_id.as_str())
+                        {
+                            let dark = Palette::dark();
+                            dev.managed_services.console_state = match error {
+                                Some(err) => {
+                                    dev.managed_services.console_buffer.push_system_line(
+                                        &format!("[Flux console interrompu : {err}]"),
+                                        Some(dark.danger),
+                                    );
+                                    ConsoleStreamState::Error(err)
+                                }
+                                None => {
+                                    dev.managed_services.console_buffer.push_system_line(
+                                        "[Flux console fermé]",
+                                        Some(dark.warning),
+                                    );
+                                    ConsoleStreamState::Closed
+                                }
+                            };
+                        }
+                    }
+                }
+                AppEvent::DockerContainersReceived {
+                    device_id,
+                    generation,
+                    response,
+                } => {
+                    if self.connection_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    let resp = *response;
+                    let mut stream_to_open: Option<(String, DockerConsoleMode)> = None;
+                    let mut should_cancel_stream = false;
+
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        dev.docker_state.docker_available = resp.docker_available;
+                        dev.docker_state.docker_version = resp.docker_version;
+                        dev.docker_state.docker_error = if resp.error_message.trim().is_empty() {
+                            None
+                        } else {
+                            Some(resp.error_message)
+                        };
+                        dev.docker_state.containers = resp.containers;
+                        dev.docker_state.is_loading = false;
+                        dev.docker_state.unsupported_by_server = false;
+
+                        if !dev.docker_state.docker_available || dev.docker_state.containers.is_empty()
+                        {
+                            dev.docker_state.selected_container_id = None;
+                            dev.docker_state.console_container_id = None;
+                            dev.docker_state.console_state = ConsoleStreamState::Idle;
+                            should_cancel_stream = true;
+                        } else {
+                            let still_exists = dev
+                                .docker_state
+                                .selected_container_id
+                                .as_deref()
+                                .is_some_and(|sel| {
+                                    dev.docker_state.containers.iter().any(|c| c.id == sel)
+                                });
+                            if !still_exists {
+                                dev.docker_state.selected_container_id = dev
+                                    .docker_state
+                                    .containers
+                                    .iter()
+                                    .find(|c| c.state.eq_ignore_ascii_case("running"))
+                                    .or_else(|| dev.docker_state.containers.first())
+                                    .map(|c| c.id.clone());
+                            }
+
+                            if let Some(cid) = dev.docker_state.selected_container_id.clone() {
+                                let same_stream = dev
+                                    .docker_state
+                                    .console_container_id
+                                    .as_deref()
+                                    == Some(cid.as_str());
+                                if !same_stream
+                                    || dev.docker_state.console_state == ConsoleStreamState::Idle
+                                {
+                                    stream_to_open = Some((cid, dev.docker_state.console_mode));
+                                }
+                            }
+                        }
+                    }
+
+                    if should_cancel_stream {
+                        self.cancel_docker_console(&device_id);
+                    } else if let Some((cid, mode)) = stream_to_open {
+                        self.open_docker_console(&device_id, &cid, mode);
+                    }
+                }
+                AppEvent::DockerContainersFailed {
+                    device_id,
+                    generation,
+                    error,
+                    is_unimplemented,
+                } => {
+                    if self.connection_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        dev.docker_state.is_loading = false;
+                        if is_unimplemented {
+                            dev.docker_state.unsupported_by_server = true;
+                        } else {
+                            dev.docker_state.set_status(
+                                format!(
+                                    "Erreur lors de la récupération des conteneurs Docker : {error}"
+                                ),
+                                true,
+                            );
+                        }
+                    }
+                }
+                AppEvent::DockerContainerControlled {
+                    device_id,
+                    generation,
+                    container_id,
+                    action,
+                    success,
+                    error,
+                } => {
+                    if self.connection_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    let mut include_all = true;
+                    let mut cancel_console = false;
+                    let mut reconnect_console: Option<(String, DockerConsoleMode)> = None;
+
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        include_all = dev.docker_state.include_all;
+                        if success {
+                            dev.docker_state.set_status(
+                                format!("Action « {action} » exécutée sur le conteneur."),
+                                false,
+                            );
+                            if action == "remove"
+                                && dev.docker_state.console_container_id.as_deref()
+                                    == Some(container_id.as_str())
+                            {
+                                dev.docker_state.console_container_id = None;
+                                dev.docker_state.console_state = ConsoleStreamState::Idle;
+                                dev.docker_state.selected_container_id = None;
+                                cancel_console = true;
+                            } else if matches!(action.as_str(), "start" | "restart" | "unpause")
+                                && dev.docker_state.selected_container_id.as_deref()
+                                    == Some(container_id.as_str())
+                                && !matches!(
+                                    dev.docker_state.console_state,
+                                    ConsoleStreamState::Streaming | ConsoleStreamState::Connecting
+                                )
+                            {
+                                reconnect_console =
+                                    Some((container_id.clone(), dev.docker_state.console_mode));
+                            }
+                        } else {
+                            dev.docker_state.set_status(
+                                format!("Échec de l'action « {action} » : {error}"),
+                                true,
+                            );
+                        }
+                    }
+
+                    if cancel_console {
+                        self.cancel_docker_console(&device_id);
+                    } else if let Some((cid, mode)) = reconnect_console {
+                        self.open_docker_console(&device_id, &cid, mode);
+                    }
+                    self.fetch_docker_containers(&device_id, include_all);
+                }
+                AppEvent::DockerCommandExecuted {
+                    device_id,
+                    generation,
+                    container_id,
+                    command,
+                    success,
+                    exit_code,
+                    stdout,
+                    stderr,
+                    error,
+                } => {
+                    if self.connection_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        let same_console = dev.docker_state.console_container_id.as_deref()
+                            == Some(container_id.as_str());
+                        if same_console {
+                            let dark = Palette::dark();
+                            if !stdout.is_empty() {
+                                dev.docker_state.console_buffer.push_bytes(stdout.as_bytes());
+                                if !stdout.ends_with('\n') {
+                                    dev.docker_state.console_buffer.push_bytes(b"\n");
+                                }
+                            }
+                            if !stderr.is_empty() {
+                                for line in stderr.lines() {
+                                    dev.docker_state
+                                        .console_buffer
+                                        .push_system_line(line, Some(dark.danger));
+                                }
+                            }
+                            if !error.is_empty() {
+                                dev.docker_state.console_buffer.push_system_line(
+                                    &format!("[Erreur exec : {error}]"),
+                                    Some(dark.danger),
+                                );
+                            } else if !success || exit_code != 0 {
+                                dev.docker_state.console_buffer.push_system_line(
+                                    &format!("[Code de sortie : {exit_code}]"),
+                                    Some(dark.warning),
+                                );
+                            } else {
+                                dev.docker_state.console_buffer.push_system_line(
+                                    &format!("[✔ Terminé (code {exit_code})]"),
+                                    Some(dark.success),
+                                );
+                            }
+                        }
+                        if !error.is_empty() {
+                            dev.docker_state.set_status(
+                                format!("Échec de « {command} » : {error}"),
+                                true,
+                            );
+                        }
+                    }
+                }
+                AppEvent::DockerConsoleReady {
+                    device_id,
+                    container_id,
+                    generation,
+                } => {
+                    if self.docker_console_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        if dev.docker_state.console_container_id.as_deref()
+                            == Some(container_id.as_str())
+                        {
+                            dev.docker_state.console_state = ConsoleStreamState::Streaming;
+                        }
+                    }
+                }
+                AppEvent::DockerConsoleChunk {
+                    device_id,
+                    container_id,
+                    generation,
+                    data,
+                    is_history: _,
+                } => {
+                    if self.docker_console_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        if dev.docker_state.console_container_id.as_deref()
+                            == Some(container_id.as_str())
+                        {
+                            dev.docker_state.console_buffer.push_bytes(&data);
+                        }
+                    }
+                }
+                AppEvent::DockerConsoleClosed {
+                    device_id,
+                    container_id,
+                    generation,
+                    error,
+                } => {
+                    if self.docker_console_gens.get(&device_id) != Some(&generation) {
+                        continue;
+                    }
+                    self.docker_console_cancel_txs.remove(&device_id);
+                    self.docker_console_input_txs.remove(&device_id);
+                    if let Some(dev) = self.devices.get_mut(&device_id) {
+                        if dev.docker_state.console_container_id.as_deref()
+                            == Some(container_id.as_str())
+                        {
+                            let dark = Palette::dark();
+                            dev.docker_state.console_state = match error {
+                                Some(err) => {
+                                    dev.docker_state.console_buffer.push_system_line(
+                                        &format!("[Flux console Docker interrompu : {err}]"),
+                                        Some(dark.danger),
+                                    );
+                                    ConsoleStreamState::Error(err)
+                                }
+                                None => {
+                                    dev.docker_state.console_buffer.push_system_line(
+                                        "[Flux console Docker fermé]",
+                                        Some(dark.warning),
+                                    );
+                                    ConsoleStreamState::Closed
+                                }
+                            };
+                        }
+                    }
+                }
             }
         }
     }
@@ -1471,7 +2927,7 @@ impl eframe::App for NtxApp {
             if let Some(dev) = self.devices.get(id) {
                 if dev.status.is_connected() {
                     match self.device_panel_state.active_tab {
-                        DeviceTab::Processes => {
+                        DeviceTab::System => {
                             if dev.process_state.auto_refresh && !dev.process_state.is_paused {
                                 need_periodic_repaint = true;
                                 if !dev.process_state.is_loading_processes {
@@ -1491,25 +2947,34 @@ impl eframe::App for NtxApp {
                                 }
                             }
                         }
-                        DeviceTab::Favorites => {
+                        DeviceTab::Services if !dev.managed_services.unsupported_by_server => {
                             need_periodic_repaint = true;
-                            let should_proc = !dev.process_state.is_loading_processes
-                                && dev
-                                    .process_state
-                                    .last_process_refresh
-                                    .map(|t| t.elapsed() >= Duration::from_secs(5))
+                            if !dev.managed_services.is_loading {
+                                let should_refresh = dev
+                                    .managed_services
+                                    .last_refresh
+                                    .map(|t| t.elapsed() >= Duration::from_secs(3))
                                     .unwrap_or(true);
-                            let should_srv = !dev.process_state.is_loading_services
-                                && dev
-                                    .process_state
-                                    .last_service_refresh
-                                    .map(|t| t.elapsed() >= Duration::from_secs(5))
-                                    .unwrap_or(true);
-                            if should_proc {
-                                self.fetch_processes(id);
+                                if should_refresh {
+                                    self.fetch_managed_services(id);
+                                }
                             }
-                            if should_srv {
-                                self.fetch_services(id);
+                        }
+                        DeviceTab::Docker
+                            if !dev.docker_state.unsupported_by_server
+                                && dev.docker_state.docker_available =>
+                        {
+                            need_periodic_repaint = true;
+                            if !dev.docker_state.is_loading {
+                                let should_refresh = dev
+                                    .docker_state
+                                    .last_refresh
+                                    .map(|t| t.elapsed() >= Duration::from_secs(4))
+                                    .unwrap_or(true);
+                                let include_all = dev.docker_state.include_all;
+                                if should_refresh {
+                                    self.fetch_docker_containers(id, include_all);
+                                }
                             }
                         }
                         _ => {}
@@ -1623,7 +3088,14 @@ impl eframe::App for NtxApp {
                         })
                     });
 
-                    if let Some(action) = overview::render(ui, &device_refs) {
+                    if let Some(action) = overview::render(
+                        ui,
+                        &mut self.overview_state,
+                        &device_refs,
+                        self.settings.overview_view_mode,
+                        self.settings.hide_virtual_disks,
+                        self.settings.hide_virtual_interfaces,
+                    ) {
                         match action {
                             OverviewAction::SelectDevice(id) => {
                                 self.active_view = ActiveView::Device;
@@ -1636,15 +3108,46 @@ impl eframe::App for NtxApp {
                             OverviewAction::DisconnectDevice(id) => {
                                 self.disconnect_device(&id);
                             }
+                            OverviewAction::ReconnectDevice(id) => {
+                                self.disconnect_device(&id);
+                                self.initiate_connect(&id, None);
+                            }
+                            OverviewAction::PingDevice(id) => {
+                                self.ping_device(&id);
+                            }
+                            OverviewAction::PingAll => {
+                                let ids: Vec<String> = self
+                                    .devices
+                                    .iter()
+                                    .filter(|(_, d)| d.status.is_connected())
+                                    .map(|(id, _)| id.clone())
+                                    .collect();
+                                for id in ids {
+                                    self.ping_device(&id);
+                                }
+                            }
                             OverviewAction::OpenTerminal(id) => {
                                 self.active_view = ActiveView::Device;
-                                self.select_device(Some(id));
                                 self.device_panel_state.active_tab = DeviceTab::Terminal;
+                                self.select_device(Some(id));
+                            }
+                            OverviewAction::OpenProcesses(id) => {
+                                self.active_view = ActiveView::Device;
+                                self.device_panel_state.active_tab = DeviceTab::System;
+                                self.select_device(Some(id));
+                            }
+                            OverviewAction::OpenFavorites(id) => {
+                                self.active_view = ActiveView::Device;
+                                self.device_panel_state.active_tab = DeviceTab::Services;
+                                self.select_device(Some(id));
                             }
                             OverviewAction::ConfigureDevice(id) => {
                                 self.active_view = ActiveView::Device;
-                                self.select_device(Some(id));
                                 self.device_panel_state.active_tab = DeviceTab::Config;
+                                self.select_device(Some(id));
+                            }
+                            OverviewAction::RemoveDevice(id) => {
+                                self.remove_device(&id);
                             }
                             OverviewAction::ConnectAll => {
                                 let with_psk: Vec<String> = self
@@ -1690,6 +3193,10 @@ impl eframe::App for NtxApp {
                             }
                             OverviewAction::RefreshDiscovery => {
                                 self.restart_discovery();
+                            }
+                            OverviewAction::SetViewMode(mode) => {
+                                self.settings.overview_view_mode = mode;
+                                let _ = self.settings.save();
                             }
                         }
                     }
@@ -1867,32 +3374,13 @@ impl eframe::App for NtxApp {
                                         d.metrics_paused = !d.metrics_paused;
                                     }
                                 }
-                                DevicePanelAction::SwitchTab(tab) => {
-                                    if tab == DeviceTab::Processes || tab == DeviceTab::Favorites {
-                                        let (need_proc, need_srv) =
-                                            if let Some(d) = self.devices.get(&id) {
-                                                if d.status.is_connected() {
-                                                    (
-                                                        d.process_state.processes.is_empty()
-                                                            && !d
-                                                                .process_state
-                                                                .is_loading_processes,
-                                                        d.process_state.services.is_empty()
-                                                            && !d.process_state.is_loading_services,
-                                                    )
-                                                } else {
-                                                    (false, false)
-                                                }
-                                            } else {
-                                                (false, false)
-                                            };
-                                        if need_proc {
-                                            self.fetch_processes(&id);
-                                        }
-                                        if need_srv {
-                                            self.fetch_services(&id);
-                                        }
+                                DevicePanelAction::ClearMetricsHistory(dev_id) => {
+                                    if let Some(d) = self.devices.get_mut(&dev_id) {
+                                        d.clear_metrics_history();
                                     }
+                                }
+                                DevicePanelAction::SwitchTab(_tab) => {
+                                    self.maybe_auto_load_active_tab(&id);
                                 }
                                 DevicePanelAction::ProcessAction(proc_action) => match proc_action {
                                     ProcessPanelAction::RefreshProcesses => {
@@ -1917,84 +3405,236 @@ impl eframe::App for NtxApp {
                                         self.open_or_run_terminal_command(&id, cmd);
                                     }
                                     ProcessPanelAction::AddFavoriteFromProcess(proc_item) => {
-                                        let fav = crate::state::FavoriteApp::new(
-                                            format!("fav_{}", uuid::Uuid::new_v4().simple()),
-                                            proc_item.name.clone(),
-                                            "⚡",
-                                            crate::state::FavoriteAppType::Process,
-                                            proc_item.name.clone(),
-                                            None,
-                                            String::new(),
-                                            format!("Processus {}", proc_item.name),
-                                            None,
-                                        );
-                                        self.add_favorite_unique(&id, fav);
+                                        let command = if proc_item.command_line.trim().is_empty() {
+                                            proc_item.name.clone()
+                                        } else {
+                                            proc_item.command_line.clone()
+                                        };
+                                        let cfg = ntx_proto::ManagedServiceConfig {
+                                            id: String::new(),
+                                            name: proc_item.name.clone(),
+                                            icon: "⚡".to_string(),
+                                            description: format!("Processus {}", proc_item.name),
+                                            command,
+                                            working_dir: String::new(),
+                                            stop_command: String::new(),
+                                            auto_start: false,
+                                            auto_restart: false,
+                                            env_vars: Vec::new(),
+                                            quick_commands: Vec::new(),
+                                            systemd_unit: String::new(),
+                                            attach_command: String::new(),
+                                        };
+                                        self.device_panel_state.active_tab = DeviceTab::Services;
+                                        self.device_panel_state
+                                            .services_state
+                                            .open_prefilled(cfg);
+                                        self.maybe_auto_load_active_tab(&id);
                                     }
                                     ProcessPanelAction::AddFavoriteFromService(srv_item) => {
-                                        let base = srv_item
+                                        let display_name = srv_item
                                             .name
                                             .strip_suffix(".service")
-                                            .unwrap_or(&srv_item.name);
-                                        let safe_unit =
-                                            srv_item.name.trim().replace('\'', "'\\''");
-                                        let fav = crate::state::FavoriteApp::new(
-                                            format!("fav_{}", uuid::Uuid::new_v4().simple()),
-                                            srv_item.name.clone(),
-                                            "⚙",
-                                            crate::state::FavoriteAppType::Service,
-                                            base.to_string(),
-                                            Some(srv_item.name.clone()),
-                                            format!("journalctl -u '{safe_unit}' -n 100 -f"),
-                                            srv_item.description.clone(),
-                                            Some(format!("systemctl start '{safe_unit}'")),
-                                        );
-                                        self.add_favorite_unique(&id, fav);
+                                            .unwrap_or(&srv_item.name)
+                                            .to_string();
+                                        let cfg = ntx_proto::ManagedServiceConfig {
+                                            id: String::new(),
+                                            name: display_name,
+                                            icon: "⚙".to_string(),
+                                            description: srv_item.description.clone(),
+                                            command: String::new(),
+                                            working_dir: String::new(),
+                                            stop_command: String::new(),
+                                            auto_start: false,
+                                            auto_restart: false,
+                                            env_vars: Vec::new(),
+                                            quick_commands: Vec::new(),
+                                            systemd_unit: srv_item.name.clone(),
+                                            attach_command: String::new(),
+                                        };
+                                        self.device_panel_state.active_tab = DeviceTab::Services;
+                                        self.device_panel_state
+                                            .services_state
+                                            .open_prefilled(cfg);
+                                        self.maybe_auto_load_active_tab(&id);
                                     }
                                 },
-                                DevicePanelAction::FavoritesAction(fav_action) => match fav_action {
-                                    FavoritesPanelAction::Refresh => {
-                                        self.fetch_processes(&id);
-                                        self.fetch_services(&id);
-                                    }
-                                    FavoritesPanelAction::ClearStatus => {
+                                DevicePanelAction::ServicesAction(svc_action) => match svc_action {
+                                    ServicesPanelAction::Refresh => {
                                         if let Some(dev) = self.devices.get_mut(&id) {
-                                            dev.process_state.clear_status();
+                                            dev.managed_services.unsupported_by_server = false;
+                                        }
+                                        self.fetch_managed_services(&id);
+                                    }
+                                    ServicesPanelAction::SelectService(svc_id) => {
+                                        let needs_stream = if let Some(dev) =
+                                            self.devices.get_mut(&id)
+                                        {
+                                            dev.managed_services.selected_service_id =
+                                                Some(svc_id.clone());
+                                            dev.managed_services.console_service_id.as_deref()
+                                                != Some(svc_id.as_str())
+                                                || !matches!(
+                                                    dev.managed_services.console_state,
+                                                    ConsoleStreamState::Streaming
+                                                        | ConsoleStreamState::Connecting
+                                                )
+                                        } else {
+                                            false
+                                        };
+                                        if needs_stream {
+                                            self.open_service_console(&id, &svc_id);
                                         }
                                     }
-                                    FavoritesPanelAction::AttachTerminal { command } => {
+                                    ServicesPanelAction::SaveService(config) => {
+                                        self.save_managed_service(&id, config);
+                                    }
+                                    ServicesPanelAction::DeleteService(svc_id) => {
+                                        self.delete_managed_service(&id, &svc_id);
+                                    }
+                                    ServicesPanelAction::ControlService {
+                                        id: svc_id,
+                                        action: act,
+                                    } => {
+                                        self.control_managed_service(&id, &svc_id, &act);
+                                    }
+                                    ServicesPanelAction::SendInput { id: svc_id, input } => {
+                                        self.send_managed_service_input(&id, &svc_id, &input);
+                                    }
+                                    ServicesPanelAction::ReconnectConsole(svc_id) => {
+                                        self.open_service_console(&id, &svc_id);
+                                    }
+                                    ServicesPanelAction::ClearConsole => {
+                                        if let Some(dev) = self.devices.get_mut(&id) {
+                                            dev.managed_services.console_buffer.clear();
+                                        }
+                                    }
+                                    ServicesPanelAction::AttachExternalTerminal { command } => {
                                         self.open_or_run_terminal_command(&id, command);
                                     }
-                                    FavoritesPanelAction::KillProcess { pid, signal } => {
-                                        self.kill_process(&id, pid, signal);
+                                    ServicesPanelAction::ImportLegacyFavorites => {
+                                        self.import_legacy_favorites(&id);
                                     }
-                                    FavoritesPanelAction::ControlService {
-                                        service_name,
-                                        action,
-                                    } => {
-                                        self.control_service(&id, &service_name, &action);
-                                    }
-                                    FavoritesPanelAction::SaveFavorite(fav) => {
+                                    ServicesPanelAction::ClearStatus => {
                                         if let Some(dev) = self.devices.get_mut(&id) {
-                                            if let Some(pos) =
-                                                dev.favorites.iter().position(|f| f.id == fav.id)
-                                            {
-                                                dev.favorites[pos] = fav;
-                                            } else {
-                                                dev.favorites.push(fav);
-                                            }
-                                            self.settings
-                                                .favorite_apps
-                                                .insert(id.clone(), dev.favorites.clone());
-                                            let _ = self.settings.save();
+                                            dev.managed_services.clear_status();
                                         }
                                     }
-                                    FavoritesPanelAction::RemoveFavorite(fav_id) => {
+                                },
+                                DevicePanelAction::DockerAction(dk_action) => match dk_action {
+                                    DockerPanelAction::Refresh { include_all } => {
                                         if let Some(dev) = self.devices.get_mut(&id) {
-                                            dev.favorites.retain(|f| f.id != fav_id);
-                                            self.settings
-                                                .favorite_apps
-                                                .insert(id.clone(), dev.favorites.clone());
-                                            let _ = self.settings.save();
+                                            dev.docker_state.unsupported_by_server = false;
+                                            dev.docker_state.docker_available = true;
+                                            dev.docker_state.docker_error = None;
+                                            dev.docker_state.include_all = include_all;
+                                        }
+                                        self.fetch_docker_containers(&id, include_all);
+                                    }
+                                    DockerPanelAction::ToggleIncludeAll(include_all) => {
+                                        if let Some(dev) = self.devices.get_mut(&id) {
+                                            dev.docker_state.include_all = include_all;
+                                        }
+                                        self.fetch_docker_containers(&id, include_all);
+                                    }
+                                    DockerPanelAction::SelectContainer(cid) => {
+                                        let open_req = if let Some(dev) = self.devices.get_mut(&id)
+                                        {
+                                            dev.docker_state.selected_container_id =
+                                                Some(cid.clone());
+                                            let needs = dev
+                                                .docker_state
+                                                .console_container_id
+                                                .as_deref()
+                                                != Some(cid.as_str())
+                                                || !matches!(
+                                                    dev.docker_state.console_state,
+                                                    ConsoleStreamState::Streaming
+                                                        | ConsoleStreamState::Connecting
+                                                );
+                                            needs.then_some(dev.docker_state.console_mode)
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(mode) = open_req {
+                                            self.open_docker_console(&id, &cid, mode);
+                                        }
+                                    }
+                                    DockerPanelAction::SetConsoleMode { container_id, mode } => {
+                                        if let Some(dev) = self.devices.get_mut(&id) {
+                                            dev.docker_state.console_mode = mode;
+                                            dev.docker_state.console_buffer.clear();
+                                        }
+                                        self.open_docker_console(&id, &container_id, mode);
+                                    }
+                                    DockerPanelAction::ControlContainer {
+                                        container_id,
+                                        action: act,
+                                        force,
+                                    } => {
+                                        self.control_docker_container(
+                                            &id,
+                                            &container_id,
+                                            &act,
+                                            force,
+                                        );
+                                    }
+                                    DockerPanelAction::SendConsoleInput {
+                                        container_id,
+                                        input,
+                                    } => {
+                                        let mut payload = input;
+                                        if !payload.ends_with('\n') && !payload.ends_with('\r') {
+                                            payload.push('\n');
+                                        }
+                                        let matches_stream = self
+                                            .devices
+                                            .get(&id)
+                                            .and_then(|d| {
+                                                d.docker_state.console_container_id.as_deref()
+                                            })
+                                            == Some(container_id.as_str());
+                                        if matches_stream {
+                                            let send_ok = self
+                                                .docker_console_input_txs
+                                                .get(&id)
+                                                .is_some_and(|tx| {
+                                                    tx.try_send(ntx_proto::DockerConsoleInput {
+                                                        input: Some(
+                                                            ntx_proto::docker_console_input::Input::Data(
+                                                                payload.into_bytes(),
+                                                            ),
+                                                        ),
+                                                    })
+                                                    .is_ok()
+                                                });
+                                            if !send_ok {
+                                                if let Some(dev) = self.devices.get_mut(&id) {
+                                                    dev.docker_state.set_status(
+                                                        "Impossible d'envoyer l'entrée : flux console Docker fermé.",
+                                                        true,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    DockerPanelAction::ExecCommand {
+                                        container_id,
+                                        command,
+                                    } => {
+                                        self.exec_docker_command(&id, &container_id, &command);
+                                    }
+                                    DockerPanelAction::ReconnectConsole { container_id, mode } => {
+                                        self.open_docker_console(&id, &container_id, mode);
+                                    }
+                                    DockerPanelAction::ClearConsole => {
+                                        if let Some(dev) = self.devices.get_mut(&id) {
+                                            dev.docker_state.console_buffer.clear();
+                                        }
+                                    }
+                                    DockerPanelAction::ClearStatus => {
+                                        if let Some(dev) = self.devices.get_mut(&id) {
+                                            dev.docker_state.clear_status();
                                         }
                                     }
                                 },

@@ -3,6 +3,8 @@
 pub mod auth;
 pub mod config;
 pub mod discovery;
+pub mod docker;
+pub mod managed_service;
 pub mod monitoring;
 pub mod process;
 pub mod server;

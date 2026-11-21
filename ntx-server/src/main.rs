@@ -6,6 +6,7 @@ use ntx_server::auth::AuthManager;
 use ntx_server::config::{
     config_dir_for_path, default_config_path, get_hostname, load_or_create_from_path,
 };
+use ntx_server::managed_service::ManagedServiceManager;
 use ntx_server::server::NtxAgentService;
 use ntx_server::{discovery, service, tls};
 use std::net::SocketAddr;
@@ -187,8 +188,16 @@ async fn run_server() -> Result<()> {
         }
     };
 
+    let managed_services_path = ManagedServiceManager::default_storage_path(&path);
+    let managed_services = ManagedServiceManager::load_or_create(managed_services_path);
+    managed_services.auto_start_configured().await;
+
     let auth_manager = AuthManager::new(&config.server.psk, config.server.session_ttl_secs);
-    let agent_service = NtxAgentService::new(config.clone(), auth_manager.clone());
+    let agent_service = NtxAgentService::with_managed_services(
+        config.clone(),
+        auth_manager.clone(),
+        managed_services.clone(),
+    );
 
     let auth_interceptor = auth_manager.clone();
     let interceptor = move |req: Request<()>| auth_interceptor.intercept(req);
@@ -197,16 +206,20 @@ async fn run_server() -> Result<()> {
     let tls_config = tls::server_tls_config(&tls_material)?;
     info!("gRPC TLS server listening on https://{}", addr);
 
-    Server::builder()
+    let serve_result = Server::builder()
         .tls_config(tls_config)?
         .add_service(NtxAgentServer::with_interceptor(agent_service, interceptor))
         .serve_with_shutdown(addr, shutdown_signal())
-        .await?;
+        .await;
+
+    info!("Stopping supervised managed services...");
+    managed_services.shutdown_all().await;
 
     if let Some(daemon) = mdns {
         let _ = daemon.shutdown();
     }
 
+    serve_result?;
     info!("NTX Server stopped cleanly.");
     Ok(())
 }

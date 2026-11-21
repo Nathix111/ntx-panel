@@ -309,6 +309,119 @@ pub fn usage_color(p: &Palette, pct: f64) -> Color32 {
     }
 }
 
+pub fn latency_color(p: &Palette, ms: u32) -> Color32 {
+    if ms >= 150 {
+        p.danger
+    } else if ms >= 60 {
+        p.warning
+    } else {
+        p.accent
+    }
+}
+
+/// Draw a compact inline sparkline with subtle gradient fill and latest-sample marker.
+#[allow(clippy::too_many_arguments)]
+pub fn sparkline(
+    ui: &mut Ui,
+    p: &Palette,
+    values: &[f64],
+    min_val: f64,
+    max_val: f64,
+    color: Color32,
+    width: f32,
+    height: f32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    let painter = ui.painter();
+    let rounding = 4.0_f32;
+    painter.rect(
+        rect,
+        rounding,
+        p.bg_subtle,
+        Stroke::new(0.5_f32, p.border),
+        egui::StrokeKind::Inside,
+    );
+
+    let inner = rect.shrink(2.0);
+    if inner.width() <= 1.0 || inner.height() <= 1.0 {
+        return response;
+    }
+
+    let mid_y = inner.center().y;
+    painter.line_segment(
+        [egui::pos2(inner.left(), mid_y), egui::pos2(inner.right(), mid_y)],
+        Stroke::new(0.5_f32, p.border.gamma_multiply(0.45)),
+    );
+
+    if values.is_empty() {
+        painter.line_segment(
+            [
+                egui::pos2(inner.left(), inner.bottom()),
+                egui::pos2(inner.right(), inner.bottom()),
+            ],
+            Stroke::new(1.0_f32, p.border),
+        );
+        return response;
+    }
+
+    let lo = if min_val.is_finite() { min_val } else { 0.0 };
+    let hi = if max_val.is_finite() && max_val > lo {
+        max_val
+    } else {
+        lo + 1.0
+    };
+    let span = hi - lo;
+
+    let map_y = |v: f64| -> f32 {
+        let safe = if v.is_finite() { v } else { lo };
+        let norm = ((safe.clamp(lo, hi) - lo) / span) as f32;
+        inner.bottom() - norm * inner.height()
+    };
+
+    let points: Vec<egui::Pos2> = if values.len() == 1 {
+        let y = map_y(values[0]);
+        vec![egui::pos2(inner.left(), y), egui::pos2(inner.right(), y)]
+    } else {
+        let last_idx = (values.len() - 1) as f32;
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let x = inner.left() + (i as f32 / last_idx) * inner.width();
+                egui::pos2(x, map_y(v))
+            })
+            .collect()
+    };
+
+    let top_fill = color.gamma_multiply(0.18);
+    let bot_fill = color.gamma_multiply(0.03);
+    let mut mesh = egui::Mesh::default();
+    for pt in &points {
+        mesh.colored_vertex(*pt, top_fill);
+        mesh.colored_vertex(egui::pos2(pt.x, inner.bottom()), bot_fill);
+    }
+    for i in 0..points.len().saturating_sub(1) {
+        let a = (i * 2) as u32;
+        let b = ((i + 1) * 2) as u32;
+        let c = (i * 2 + 1) as u32;
+        let d = ((i + 1) * 2 + 1) as u32;
+        mesh.add_triangle(a, b, c);
+        mesh.add_triangle(b, d, c);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+    painter.line(points.clone(), Stroke::new(1.5_f32, color));
+
+    if let Some(&last_pt) = points.last() {
+        painter.circle_filled(last_pt, 2.2, color);
+    }
+
+    response
+}
+
 pub fn format_uptime(secs: u64) -> String {
     let days = secs / 86_400;
     let hours = (secs % 86_400) / 3_600;
@@ -342,6 +455,25 @@ pub fn format_ram(bytes: u64) -> String {
         format!("{:.2} Go", mb / 1024.0)
     } else {
         format!("{:.1} Mo", mb)
+    }
+}
+
+pub fn format_storage(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * KB;
+    const GB: f64 = 1024.0 * MB;
+    const TB: f64 = 1024.0 * GB;
+    let b = bytes as f64;
+    if bytes < 1024 {
+        format!("{bytes} o")
+    } else if b < MB {
+        format!("{:.0} Ko", b / KB)
+    } else if b < GB {
+        format!("{:.0} Mo", b / MB)
+    } else if b < TB {
+        format!("{:.1} Go", b / GB)
+    } else {
+        format!("{:.2} To", b / TB)
     }
 }
 
@@ -397,5 +529,19 @@ mod tests {
         assert_eq!(usage_color(&dark, 25.0), dark.success);
         assert_eq!(usage_color(&dark, 70.0), dark.warning);
         assert_eq!(usage_color(&dark, 92.0), dark.danger);
+    }
+
+    #[test]
+    fn test_format_storage_and_latency_color() {
+        assert_eq!(format_storage(512), "512 o");
+        assert_eq!(format_storage(2048), "2 Ko");
+        assert_eq!(format_storage(50 * 1024 * 1024), "50 Mo");
+        assert_eq!(format_storage(128 * 1024 * 1024 * 1024), "128.0 Go");
+        assert_eq!(format_storage(2 * 1024 * 1024 * 1024 * 1024), "2.00 To");
+
+        let dark = Palette::dark();
+        assert_eq!(latency_color(&dark, 15), dark.accent);
+        assert_eq!(latency_color(&dark, 60), dark.warning);
+        assert_eq!(latency_color(&dark, 150), dark.danger);
     }
 }

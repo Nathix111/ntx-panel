@@ -23,6 +23,20 @@ service NtxAgent {
     rpc KillProcess(KillProcessRequest) returns (KillProcessResponse);
     rpc ListServices(ListServicesRequest) returns (ListServicesResponse);
     rpc ControlService(ControlServiceRequest) returns (ControlServiceResponse);
+
+    // Managed Services (supervised by ntx-server with live PTY console)
+    rpc ListManagedServices(ListManagedServicesRequest) returns (ListManagedServicesResponse);
+    rpc SaveManagedService(SaveManagedServiceRequest) returns (SaveManagedServiceResponse);
+    rpc DeleteManagedService(DeleteManagedServiceRequest) returns (DeleteManagedServiceResponse);
+    rpc ControlManagedService(ControlManagedServiceRequest) returns (ControlManagedServiceResponse);
+    rpc SendManagedServiceInput(SendManagedServiceInputRequest) returns (SendManagedServiceInputResponse);
+    rpc StreamManagedServiceConsole(StreamManagedServiceConsoleRequest) returns (stream ConsoleChunk);
+
+    // Docker Container Management
+    rpc ListDockerContainers(ListDockerContainersRequest) returns (ListDockerContainersResponse);
+    rpc ControlDockerContainer(ControlDockerContainerRequest) returns (ControlDockerContainerResponse);
+    rpc ExecDockerCommand(ExecDockerCommandRequest) returns (ExecDockerCommandResponse);
+    rpc StreamDockerConsole(stream DockerConsoleInput) returns (stream ConsoleChunk);
 }
 
 // === Auth ===
@@ -186,4 +200,159 @@ message ControlServiceRequest {
 message ControlServiceResponse {
     bool success = 1;
     string error_message = 2;
+}
+
+// === Shared Live Console Output ===
+
+message ConsoleChunk {
+    bytes data = 1;
+    uint64 timestamp_ms = 2;
+    bool is_history = 3; // true when replaying ring buffer / initial tail
+}
+
+// === Managed Services ===
+
+message ManagedServiceConfig {
+    string id = 1;
+    string name = 2;
+    string icon = 3;
+    string description = 4;
+    string command = 5;
+    string working_dir = 6;
+    string stop_command = 7;
+    bool auto_start = 8;
+    bool auto_restart = 9;
+    repeated string env_vars = 10;
+    repeated string quick_commands = 11;
+    string systemd_unit = 12;
+    string attach_command = 13;
+}
+
+message ManagedServiceStatus {
+    ManagedServiceConfig config = 1;
+    string state = 2;             // "running", "starting", "stopping", "stopped", "crashed"
+    uint32 pid = 3;
+    float cpu_usage = 4;
+    uint64 memory_bytes = 5;
+    uint64 uptime_seconds = 6;
+    int32 last_exit_code = 7;
+    bool has_exit_code = 8;
+    uint32 restart_count = 9;
+    string last_error = 10;
+}
+
+message ListManagedServicesRequest {}
+
+message ListManagedServicesResponse {
+    repeated ManagedServiceStatus services = 1;
+}
+
+message SaveManagedServiceRequest {
+    ManagedServiceConfig config = 1;
+}
+
+message SaveManagedServiceResponse {
+    bool success = 1;
+    string error_message = 2;
+    ManagedServiceConfig service = 3;
+}
+
+message DeleteManagedServiceRequest {
+    string id = 1;
+}
+
+message DeleteManagedServiceResponse {
+    bool success = 1;
+    string error_message = 2;
+}
+
+message ControlManagedServiceRequest {
+    string id = 1;
+    string action = 2; // "start", "stop", "restart", "kill"
+}
+
+message ControlManagedServiceResponse {
+    bool success = 1;
+    string error_message = 2;
+}
+
+message SendManagedServiceInputRequest {
+    string id = 1;
+    string input = 2;
+    bool append_newline = 3;
+}
+
+message SendManagedServiceInputResponse {
+    bool success = 1;
+    string error_message = 2;
+}
+
+message StreamManagedServiceConsoleRequest {
+    string id = 1;
+    uint32 tail_lines = 2;
+}
+
+// === Docker Containers ===
+
+message DockerContainerItem {
+    string id = 1;
+    string name = 2;
+    string image = 3;
+    string state = 4;             // "running", "exited", "paused", "restarting", "created", "dead"
+    string status = 5;
+    string ports = 6;
+    string created = 7;
+    double cpu_percent = 8;
+    uint64 memory_used_bytes = 9;
+    uint64 memory_limit_bytes = 10;
+    string compose_project = 11;
+}
+
+message ListDockerContainersRequest {
+    bool include_all = 1;
+}
+
+message ListDockerContainersResponse {
+    bool docker_available = 1;
+    string docker_version = 2;
+    string error_message = 3;
+    repeated DockerContainerItem containers = 4;
+}
+
+message ControlDockerContainerRequest {
+    string container_id = 1;
+    string action = 2; // "start", "stop", "restart", "pause", "unpause", "kill", "remove"
+    bool force = 3;
+}
+
+message ControlDockerContainerResponse {
+    bool success = 1;
+    string error_message = 2;
+}
+
+message ExecDockerCommandRequest {
+    string container_id = 1;
+    string command = 2;
+}
+
+message ExecDockerCommandResponse {
+    bool success = 1;
+    int32 exit_code = 2;
+    string stdout = 3;
+    string stderr = 4;
+    string error_message = 5;
+}
+
+message DockerConsoleInit {
+    string container_id = 1;
+    string mode = 2;       // "logs", "attach", "shell"
+    uint32 tail_lines = 3;
+}
+
+message DockerConsoleInput {
+    oneof input {
+        DockerConsoleInit init = 1;
+        bytes data = 2;
+        TerminalResize resize = 3;
+    }
 }
